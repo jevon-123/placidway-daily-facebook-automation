@@ -148,7 +148,30 @@ function env(key, fallback) {
 
 const bool = (v, d) => (v === undefined ? d : String(v).toLowerCase() === 'true');
 
+// Any OpenAI-compatible endpoint works here — Gemini, Groq, OpenRouter,
+// Together, a local Ollama. They all expose /chat/completions and all take
+// 'Authorization: Bearer <key>', so swapping provider is a URL and a credential,
+// not a code change.
+const llmBaseUrl = env('PW_LLM_BASE_URL', ${JSON.stringify(
+    PROVIDER === 'anthropic'
+      ? 'https://api.anthropic.com/v1/messages'
+      : 'https://api.openai.com/v1/chat/completions',
+  )});
+
+// response_format: json_object is an OpenAI extension. Gemini's compatibility
+// layer does not document it and other gateways ignore or reject it, so it is
+// on only for OpenAI itself unless explicitly overridden. Turning it off is
+// safe: readJsonLoose() already recovers JSON from fenced or prose-wrapped
+// replies, which is how the pipeline survives a model that will not do
+// strict JSON at all.
+const jsonModeOverride = env('PW_LLM_JSON_MODE', '');
+const llmJsonMode = jsonModeOverride === ''
+  ? llmBaseUrl.indexOf('api.openai.com') !== -1
+  : bool(jsonModeOverride, true);
+
 const run = {
+  llmBaseUrl: llmBaseUrl,
+  llmJsonMode: llmJsonMode,
   runId: $execution.id + '-' + Date.now(),
   runAt: new Date().toISOString(),
 
@@ -425,17 +448,12 @@ const body = toProviderBody(${JSON.stringify(PROVIDER)}, {
   model: d.run.model,
   temperature: 0.7,
   maxTokens: 1200,
-  jsonMode: true,
+  jsonMode: d.run.llmJsonMode,
 });
 
 return [{ json: { ...d, body } }];`,
 );
 connect('Usable Content?', 'Build Generator Request', 0);
-
-const LLM_URL =
-  PROVIDER === 'anthropic'
-    ? 'https://api.anthropic.com/v1/messages'
-    : 'https://api.openai.com/v1/chat/completions';
 
 const LLM_HEADERS =
   PROVIDER === 'anthropic'
@@ -450,7 +468,7 @@ const LLM_CREDENTIAL =
 function llmNode(name, position) {
   return node(name, 'n8n-nodes-base.httpRequest', 4.2, position, {
     method: 'POST',
-    url: LLM_URL,
+    url: '={{ $json.run.llmBaseUrl }}',
     authentication: 'genericCredentialType',
     genericAuthType: 'httpHeaderAuth',
     sendHeaders: true,
@@ -562,7 +580,7 @@ const body = toProviderBody(${JSON.stringify(PROVIDER)}, {
   model: d.run.model,
   temperature: 0,
   maxTokens: 800,
-  jsonMode: true,
+  jsonMode: d.run.llmJsonMode,
 });
 
 return [{ json: { ...d, body } }];`,

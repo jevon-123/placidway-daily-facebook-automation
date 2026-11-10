@@ -213,8 +213,33 @@ which needs a Google Cloud project with the Sheets API enabled and
 
 | Provider | Header name | Header value |
 |---|---|---|
-| OpenAI | `Authorization` | `Bearer sk-...` |
+| OpenAI-compatible | `Authorization` | `Bearer <key>` |
 | Anthropic | `x-api-key` | `sk-ant-...` |
+
+#### Using a different provider
+
+`PW_LLM_PROVIDER=openai` selects the OpenAI **wire format**, not the company.
+Any endpoint that speaks `/chat/completions` and takes a bearer token works —
+set `PW_LLM_BASE_URL` and `PW_MODEL` and change nothing else:
+
+| Provider | `PW_LLM_BASE_URL` | Cost |
+|---|---|---|
+| OpenAI | `https://api.openai.com/v1/chat/completions` | paid |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions` | free tier |
+| Groq | `https://api.groq.com/openai/v1/chat/completions` | free tier |
+| OpenRouter | `https://openrouter.ai/api/v1/chat/completions` | some free models |
+| Ollama (local) | `http://localhost:11434/v1/chat/completions` | free, no key |
+
+One caveat worth knowing. `response_format: {"type": "json_object"}` is an
+OpenAI extension; Gemini's compatibility layer does not document it and some
+gateways reject unknown fields outright. So it is enabled only for
+`api.openai.com` unless `PW_LLM_JSON_MODE` says otherwise.
+
+Turning it off costs nothing: `readJsonLoose()` in `lib/compose.js` already
+pulls JSON out of fenced or prose-wrapped replies, and a reply it cannot parse
+becomes a `GENERATION_FAILED` violation that the retry loop handles. Strict
+JSON mode is an optimisation here, never a dependency — which is the reason the
+pipeline ports to a free provider in two environment variables.
 
 ### 6. Telegram (drafts and alerts)
 
@@ -242,6 +267,8 @@ for email means replacing two nodes; nothing else changes.
 | `PW_SCHEDULE_OFFSET_MINUTES` | `60` | How far ahead `schedule` mode posts |
 | `PW_FORCE_CONTENT_TYPE` | *(empty)* | Override the weekday rotation |
 | `PW_MODEL` | provider default | Model name |
+| `PW_LLM_BASE_URL` | provider default | Any OpenAI-compatible endpoint |
+| `PW_LLM_JSON_MODE` | auto | Force `response_format` on or off |
 | `PW_SHEET_ID` | — | Google Sheet ID |
 | `PW_FB_PAGE_ID` | — | Test Page ID |
 | `PW_FB_GRAPH_VERSION` | `v21.0` | Graph API version |
@@ -569,8 +596,10 @@ Stated plainly, because they are the interesting part of the conversation.
 - **Credential-bound node parameters are not statically verifiable.** The
   validator proves the graph is sound. It cannot prove your Google Sheets
   resource locators resolve — see the note in [Setup](#2-import-the-workflows).
-- **One LLM provider per import.** Swapping means rebuilding with
-  `--provider=` and re-importing, rather than flipping an environment variable.
-  That was a deliberate trade: a runtime switch would have put provider
-  branching inside expressions, which is the thing this design is most trying
-  to avoid.
+- **One LLM *wire format* per import.** Within the OpenAI format, switching
+  provider is just `PW_LLM_BASE_URL` — OpenAI, Gemini, Groq, OpenRouter and a
+  local Ollama all work against the same import. Crossing to Anthropic's native
+  format does need a rebuild with `--provider=anthropic`, because the request
+  and response shapes differ. A runtime switch between the two would have put
+  provider branching inside n8n expressions, which is the thing this design is
+  most trying to avoid.

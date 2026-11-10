@@ -116,9 +116,19 @@ it unit-tested outside the platform. n8n also self-hosts free, exports to
 readable JSON that diffs in git, and has a native error-workflow hook.
 
 **"Why HTTP Request nodes instead of the native OpenAI/Facebook nodes?"**
-Explicitness and portability. The request body is visible and testable, the
-token lives in a header-auth credential so it never enters the export, and
-swapping providers is a build flag rather than a node replacement.
+Explicitness and portability. The request body is visible and testable, and the
+token lives in a header-auth credential so it never enters the export. It also
+made the provider swap nearly free: because the body is built by
+`toProviderBody()` in a Code node rather than configured in a vendor node, any
+OpenAI-compatible endpoint — Gemini, Groq, OpenRouter, a local Ollama — is just
+`PW_LLM_BASE_URL`. The native OpenAI node would have pinned me to one vendor.
+
+**"Doesn't dropping `response_format: json_object` make parsing fragile?"**
+No, because it was never relied on. `readJsonLoose()` strips code fences and
+finds the JSON object in prose, and a reply it still cannot parse becomes a
+`GENERATION_FAILED` violation that the retry loop handles with feedback. Strict
+JSON mode is an optimisation, not a dependency — which is exactly why the
+pipeline runs on a free Gemini key without touching the code.
 
 ---
 

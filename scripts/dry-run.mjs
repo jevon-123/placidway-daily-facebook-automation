@@ -51,8 +51,33 @@ const args = Object.fromEntries(
 );
 
 const PROVIDER = (process.env.PW_LLM_PROVIDER || 'openai').toLowerCase();
-const API_KEY = PROVIDER === 'anthropic' ? process.env.ANTHROPIC_API_KEY : process.env.OPENAI_API_KEY;
 const USE_LLM = !args['no-llm'];
+
+// Any OpenAI-compatible endpoint works: Gemini, Groq, OpenRouter, a local
+// Ollama. They all take 'Authorization: Bearer <key>' on /chat/completions.
+const LLM_BASE_URL =
+  process.env.PW_LLM_BASE_URL ||
+  (PROVIDER === 'anthropic'
+    ? 'https://api.anthropic.com/v1/messages'
+    : 'https://api.openai.com/v1/chat/completions');
+
+// response_format: json_object is an OpenAI extension. Off by default anywhere
+// else, because some gateways reject an unknown field outright. readJsonLoose()
+// recovers JSON from fenced or prose-wrapped replies regardless.
+const JSON_MODE =
+  process.env.PW_LLM_JSON_MODE === undefined || process.env.PW_LLM_JSON_MODE === ''
+    ? LLM_BASE_URL.includes('api.openai.com')
+    : String(process.env.PW_LLM_JSON_MODE).toLowerCase() === 'true';
+
+// First key found wins, so one .env can carry several providers.
+const API_KEY =
+  PROVIDER === 'anthropic'
+    ? process.env.ANTHROPIC_API_KEY
+    : process.env.OPENAI_API_KEY ||
+      process.env.GEMINI_API_KEY ||
+      process.env.GROQ_API_KEY ||
+      process.env.OPENROUTER_API_KEY ||
+      process.env.PW_LLM_API_KEY;
 
 const SITEMAPS = {
   article: 'https://www.placidway.com/1/sitemap_articles.xml',
@@ -126,9 +151,15 @@ async function getText(url) {
 async function callModel({ system, user, temperature, maxTokens }) {
   if (!API_KEY) {
     throw new Error(
-      `No API key. Set ${PROVIDER === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY'}, ` +
-        'or pass --no-llm to stop after extraction.',
+      `No API key. Set ${
+        PROVIDER === 'anthropic'
+          ? 'ANTHROPIC_API_KEY'
+          : 'OPENAI_API_KEY (or GEMINI_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY / PW_LLM_API_KEY)'
+      }, or pass --no-llm to stop after extraction.`,
     );
+  }
+  if (/^sk-kunci|^sk-\.\.\.|your-key|YOUR_KEY/i.test(API_KEY)) {
+    throw new Error(`That looks like a placeholder, not a key: "${API_KEY}". Paste the real one.`);
   }
 
   const body = toProviderBody(PROVIDER, {
@@ -137,20 +168,15 @@ async function callModel({ system, user, temperature, maxTokens }) {
     model: run.model,
     temperature,
     maxTokens,
-    jsonMode: true,
+    jsonMode: JSON_MODE,
   });
-
-  const url =
-    PROVIDER === 'anthropic'
-      ? 'https://api.anthropic.com/v1/messages'
-      : 'https://api.openai.com/v1/chat/completions';
 
   const headers =
     PROVIDER === 'anthropic'
       ? { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' }
       : { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` };
 
-  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const res = await fetch(LLM_BASE_URL, { method: 'POST', headers, body: JSON.stringify(body) });
   const json = await res.json();
   if (!res.ok) {
     throw new Error(`${PROVIDER} HTTP ${res.status}: ${JSON.stringify(json).slice(0, 400)}`);
@@ -291,6 +317,10 @@ const state = loadState();
 const produced = [];
 
 console.log(`provider     : ${PROVIDER}${USE_LLM ? ` (${run.model})` : ' — LLM disabled'}`);
+if (USE_LLM) {
+  console.log(`endpoint     : ${LLM_BASE_URL}`);
+  console.log(`json mode    : ${JSON_MODE}`);
+}
 console.log(`content type : ${run.contentType}`);
 console.log(`price policy : ${run.allowPriceMention ? 'citation allowed, must match source' : 'no prices'}`);
 
