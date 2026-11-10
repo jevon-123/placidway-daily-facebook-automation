@@ -21,7 +21,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$NodeDir = 'C:\Users\jevon\tools\node-v26.13.0-win-x64'
+$NodeDir = 'C:\Users\jevon\tools\node-v24.22.2-win-x64'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $env:Path = "$NodeDir;$env:Path"
 

@@ -23,13 +23,44 @@ needed to publish for real.
 
 ## 1. Install and start n8n
 
+### Use Node 24, not the newest Node
+
+n8n pulls in `@confluentinc/kafka-javascript`, a native module that ships
+prebuilt binaries per Node ABI. The published Windows builds stop at
+`node-v137`, which is **Node 24**:
+
+```
+confluent-kafka-javascript-v1.9.1-node-v137-win32-unknown-x64.tar.gz   <- Node 24
+```
+
+On Node 26 (`node-v147`) there is no prebuilt, so npm falls back to compiling
+from source with node-gyp — which on Windows needs the Visual C++ build tools.
+Without them the install dies partway through with a wall of `gyp ERR!`. MinGW
+does not help; node-gyp only accepts MSVC.
+
+Node 24 avoids the problem entirely and is what n8n actually supports:
+n8n 2.x requires `>=24.0.0`, n8n 1.x requires `>=20.19 <= 24.x`.
+
 ```powershell
-& 'C:\Users\jevon\tools\node-v26.13.0-win-x64\npm.cmd' install -g n8n
+# One-time: portable Node 24 alongside whatever else you have installed
+$v = 'v24.22.2'
+Invoke-WebRequest "https://nodejs.org/dist/$v/node-$v-win-x64.zip" -OutFile "$env:TEMP\node24.zip"
+Expand-Archive "$env:TEMP\node24.zip" -DestinationPath 'C:\Users\jevon\tools' -Force
+```
+
+### Install and run
+
+```powershell
+& 'C:\Users\jevon\tools\node-v24.22.2-win-x64\npm.cmd' install -g n8n
 cd C:\Users\jevon\placidway-automation
 .\setup\make-local-env.ps1
 .\setup\import-workflows.ps1
 .\setup\start-n8n.ps1
 ```
+
+The scripts in `setup/` point at the Node 24 directory. The project's own
+scripts (`npm test`, `scripts/dry-run.mjs`) run on any Node 18+, so you can
+keep using whichever Node you already had for those.
 
 Open <http://localhost:5678> and create the owner account. It is local only —
 the email and password are stored on your machine, not sent anywhere.
