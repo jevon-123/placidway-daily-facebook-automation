@@ -121,15 +121,30 @@ node scripts/make-samples.mjs --from=dry-run
 
 ## Setup
 
+> **Setting this up for the first time?** [`docs/n8n-setup.md`](docs/n8n-setup.md)
+> walks through it click by click, including the Google service account and the
+> Facebook token exchange. The scripts in [`setup/`](setup/) handle the parts
+> that can be automated. This section is the reference; that one is the path.
+
 ### 1. n8n
 
 Self-hosted or cloud, both work. Locally:
 
-```bash
-npx n8n
+```powershell
+& 'C:\Users\jevon\tools\node-v26.13.0-win-x64\npm.cmd' install -g n8n
+.\setup\make-local-env.ps1      # creates the gitignored secrets file
+.\setup\import-workflows.ps1    # imports both workflows, prints their IDs
+.\setup\start-n8n.ps1           # starts n8n with every variable set correctly
 ```
 
-Then set the environment from [`.env.example`](.env.example). Two are
+`start-n8n.ps1` exists because this workflow depends on environment variables
+that n8n does not set by default — most importantly
+`N8N_BLOCK_ENV_ACCESS_IN_NODE=false`. Starting n8n any other way leaves the
+`Config` node falling back to its built-in defaults, silently.
+
+Add `-Tunnel` when you need approval links that work on a phone.
+
+Set the environment from [`.env.example`](.env.example). Two are
 load-bearing:
 
 - `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` — the `Config` node reads settings
@@ -592,6 +607,14 @@ by a password change or a permissions review. When that happens the alert says
 │   ├── dry-run.mjs           full pipeline locally, without n8n
 │   ├── fetch-fixtures.mjs    refresh fixtures from the live site
 │   └── make-samples.mjs      builds samples/sample-posts.md
+├── setup/                    first-run scripts
+│   ├── start-n8n.ps1         starts n8n with the right environment
+│   ├── make-local-env.ps1    creates the gitignored secrets file
+│   └── import-workflows.ps1  imports both workflows, prints their IDs
+├── docs/
+│   ├── n8n-setup.md          click-by-click first-time setup
+│   ├── recording-script.md   beat sheet for the screen recording
+│   └── walkthrough-prep.md   likely interview questions, with answers
 ├── workflow/                 GENERATED — do not hand-edit
 │   ├── placidway-daily-facebook.openai.json
 │   ├── placidway-daily-facebook.anthropic.json

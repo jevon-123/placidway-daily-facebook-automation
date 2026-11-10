@@ -4,6 +4,10 @@ node_modules/
 .env
 .env.local
 
+# Per-machine secrets for setup/start-n8n.ps1. The template that generates it
+# (setup/make-local-env.ps1) IS committed; the filled-in copy never is.
+setup/local.env.ps1
+
 # Dry-run artefacts. samples/sample-posts.md IS committed — it is a deliverable.
 samples/generated/
 samples/dry-run-state.json
