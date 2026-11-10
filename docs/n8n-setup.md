@@ -146,7 +146,23 @@ no consent screen, no redirect URI, no re-authorising every week.
    *Skipping this is the single most common mistake.* The service account can
    only see spreadsheets that have been shared with it, exactly like a person.
 
-In n8n: **Credentials → Add credential → Google Sheets API**, set
+### 3c. Check it before you touch n8n
+
+```powershell
+node scripts\verify-sheet.mjs --key=C:\path\to\downloaded-key.json --sheet=<SPREADSHEET_ID>
+```
+
+This signs in as the service account, opens the spreadsheet, and compares both
+header rows against `docs/sheet-templates/` — which are generated from the
+workflow code, so it checks your sheet against what the workflow genuinely
+writes rather than against a list someone typed twice.
+
+It names the exact problem: not shared, tab missing, header misspelled. Ten
+seconds here saves half an hour of blaming the credential.
+
+### 3d. The n8n credential
+
+**Credentials → Add credential → Google Sheets API**, set
 **Authentication** to **Service Account**:
 
 | Field | From the JSON file |
