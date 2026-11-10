@@ -172,6 +172,13 @@ const llmJsonMode = jsonModeOverride === ''
 const run = {
   llmBaseUrl: llmBaseUrl,
   llmJsonMode: llmJsonMode,
+
+  // Generous because reasoning models spend this budget thinking before they
+  // write. At 1200 against Gemini 3.5 Flash the generator never reached the
+  // JSON. See the note on toProviderBody().
+  maxOutputTokens: Number(env('PW_MAX_OUTPUT_TOKENS', 4000)),
+  // "none" | "low" | "medium" | "high", or empty to omit the field entirely.
+  reasoningEffort: env('PW_LLM_REASONING_EFFORT', ''),
   runId: $execution.id + '-' + Date.now(),
   runAt: new Date().toISOString(),
 
@@ -447,8 +454,9 @@ const body = toProviderBody(${JSON.stringify(PROVIDER)}, {
   user,
   model: d.run.model,
   temperature: 0.7,
-  maxTokens: 1200,
+  maxTokens: d.run.maxOutputTokens,
   jsonMode: d.run.llmJsonMode,
+  reasoningEffort: d.run.reasoningEffort,
 });
 
 return [{ json: { ...d, body } }];`,
@@ -495,18 +503,29 @@ code(
 
 // ---- node driver ----------------------------------------------------------
 const base = $('Build Generator Request').first().json;
-const raw = readCompletionText(${JSON.stringify(PROVIDER)}, $input.first().json);
+const response = $input.first().json;
+const raw = readCompletionText(${JSON.stringify(PROVIDER)}, response);
+const finishReason = readFinishReason(${JSON.stringify(PROVIDER)}, response);
 const parsed = readJsonLoose(raw);
 
 if (!parsed || !parsed.post_text) {
   // An unreadable generation is a failed attempt, not a crash. Hand it to the
   // rule checker with an explicit violation so the retry loop picks it up and
   // the reason lands in the run log.
+  //
+  // finish_reason is called out separately because truncation and malformed
+  // output look identical downstream but have opposite fixes: one needs a
+  // bigger token budget, the other a better prompt.
+  const truncated = finishReason === 'length' || finishReason === 'max_tokens';
   return [{
     json: {
       ...base,
       post: { post_text: '' },
-      generationError: 'Model did not return usable JSON containing post_text.',
+      generationError: truncated
+        ? 'Model ran out of output budget before finishing (finish_reason=' + finishReason +
+          '). Raise PW_MAX_OUTPUT_TOKENS, or set PW_LLM_REASONING_EFFORT=none if this is a reasoning model.'
+        : 'Model did not return usable JSON containing post_text (finish_reason=' + finishReason + ').',
+      finishReason: finishReason,
       rawCompletion: String(raw).slice(0, 2000),
       body: undefined,
     },
@@ -579,8 +598,9 @@ const body = toProviderBody(${JSON.stringify(PROVIDER)}, {
   user,
   model: d.run.model,
   temperature: 0,
-  maxTokens: 800,
+  maxTokens: d.run.maxOutputTokens,
   jsonMode: d.run.llmJsonMode,
+  reasoningEffort: d.run.reasoningEffort,
 });
 
 return [{ json: { ...d, body } }];`,

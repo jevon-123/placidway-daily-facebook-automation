@@ -230,16 +230,46 @@ set `PW_LLM_BASE_URL` and `PW_MODEL` and change nothing else:
 | OpenRouter | `https://openrouter.ai/api/v1/chat/completions` | some free models |
 | Ollama (local) | `http://localhost:11434/v1/chat/completions` | free, no key |
 
-One caveat worth knowing. `response_format: {"type": "json_object"}` is an
-OpenAI extension; Gemini's compatibility layer does not document it and some
-gateways reject unknown fields outright. So it is enabled only for
-`api.openai.com` unless `PW_LLM_JSON_MODE` says otherwise.
+Two caveats, both learned the hard way against Gemini's free tier.
 
-Turning it off costs nothing: `readJsonLoose()` in `lib/compose.js` already
-pulls JSON out of fenced or prose-wrapped replies, and a reply it cannot parse
-becomes a `GENERATION_FAILED` violation that the retry loop handles. Strict
-JSON mode is an optimisation here, never a dependency — which is the reason the
-pipeline ports to a free provider in two environment variables.
+**`response_format` is an OpenAI extension.** Gemini's compatibility layer does
+not document `{"type": "json_object"}` and some gateways reject unknown fields
+outright, so it is enabled only for `api.openai.com` unless `PW_LLM_JSON_MODE`
+says otherwise. Turning it off costs nothing: `readJsonLoose()` already pulls
+JSON out of fenced or prose-wrapped replies, and a reply it cannot parse becomes
+a `GENERATION_FAILED` violation the retry loop handles. Strict JSON mode is an
+optimisation here, never a dependency.
+
+**Reasoning models spend the output budget before they write.** This one is
+worth internalising because it does not look like an error. Running the
+generator against Gemini 3.5 Flash at `max_tokens: 1200`:
+
+| `max_tokens` | `finish_reason` | visible tokens | total tokens | Result |
+|---|---|---|---|---|
+| 1200 | `length` | 48 | 3277 | tail of its own reasoning, no JSON |
+| 4000 | `stop` | 390 | 4841 | valid JSON |
+| 4000 + `reasoning_effort: none` | `stop` | 462 | **2543** | valid JSON, ~47% cheaper |
+
+At 1200 the model burned roughly 1,150 tokens thinking, hit the cap, and what
+leaked out was the end of its own arithmetic — `" + 87 + 1 + 87 + 1 + 88 = 422
+chars"`. Downstream that is indistinguishable from a model that cannot follow
+instructions. Hence `PW_MAX_OUTPUT_TOKENS` defaults to 4000, and
+`PW_LLM_REASONING_EFFORT=none` is worth setting on any reasoning model.
+
+`Parse Generated Post` now reports `finish_reason` in the failure message, so
+truncation and malformed output are distinguishable in the run log rather than
+having to be rediscovered.
+
+**Model availability shifts.** `gemini-2.5-flash` returns 404 for new API keys.
+List what your key can actually reach before picking one:
+
+```bash
+curl -H "x-goog-api-key: $GEMINI_API_KEY" \
+  https://generativelanguage.googleapis.com/v1beta/models
+```
+
+Free-tier quota is per model, so a 429 on one model does not mean a 429 on
+another — `gemini-3.1-flash-lite` has been the most forgiving.
 
 ### 6. Telegram (drafts and alerts)
 
@@ -269,6 +299,8 @@ for email means replacing two nodes; nothing else changes.
 | `PW_MODEL` | provider default | Model name |
 | `PW_LLM_BASE_URL` | provider default | Any OpenAI-compatible endpoint |
 | `PW_LLM_JSON_MODE` | auto | Force `response_format` on or off |
+| `PW_MAX_OUTPUT_TOKENS` | `4000` | Output budget; reasoning eats this before writing |
+| `PW_LLM_REASONING_EFFORT` | *(empty)* | `none` \| `low` \| `medium` \| `high` |
 | `PW_SHEET_ID` | — | Google Sheet ID |
 | `PW_FB_PAGE_ID` | — | Test Page ID |
 | `PW_FB_GRAPH_VERSION` | `v21.0` | Graph API version |

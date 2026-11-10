@@ -123,6 +123,21 @@ made the provider swap nearly free: because the body is built by
 OpenAI-compatible endpoint — Gemini, Groq, OpenRouter, a local Ollama — is just
 `PW_LLM_BASE_URL`. The native OpenAI node would have pinned me to one vendor.
 
+**"Tell me about a bug you hit building this."**
+The best one. On Gemini the generator kept returning unparseable output — no
+error, HTTP 200, just not JSON. What leaked out was the tail of the model's own
+arithmetic: `" + 87 + 1 + 87 + 1 + 88 = 422 chars"`. The cause was that
+reasoning models spend the output budget thinking *before* they write, so
+`max_tokens: 1200` — fine for a non-reasoning model — was consumed by reasoning
+and hit the cap mid-thought. `finish_reason` said `length`, 48 visible tokens
+out of 3277 used.
+
+Two fixes: raise the default budget to 4000, and expose
+`PW_LLM_REASONING_EFFORT`, which on the same call halved total token use. The
+third fix matters more than either — `Parse Generated Post` now reports
+`finish_reason` in its failure message, because truncation and malformed output
+are indistinguishable downstream and have opposite remedies.
+
 **"Doesn't dropping `response_format: json_object` make parsing fragile?"**
 No, because it was never relied on. `readJsonLoose()` strips code fences and
 finds the JSON object in prose, and a reply it still cannot parse becomes a

@@ -32,6 +32,7 @@ import {
   composeValidator,
   toProviderBody,
   readCompletionText,
+  readFinishReason,
   readJsonLoose,
   normalisePost,
 } from '../lib/compose.js';
@@ -96,6 +97,8 @@ const run = {
   candidateLimit: Number(process.env.PW_CANDIDATE_LIMIT || 40),
   minBodyLength: Number(process.env.PW_MIN_BODY_LENGTH || 400),
   model: process.env.PW_MODEL || (PROVIDER === 'anthropic' ? 'claude-sonnet-5-5' : 'gpt-4o-mini'),
+  maxOutputTokens: Number(process.env.PW_MAX_OUTPUT_TOKENS || 4000),
+  reasoningEffort: process.env.PW_LLM_REASONING_EFFORT || '',
   userAgent: process.env.PW_USER_AGENT || 'PlacidWayContentBot/1.0 (take-home assessment demo)',
 };
 
@@ -169,6 +172,7 @@ async function callModel({ system, user, temperature, maxTokens }) {
     temperature,
     maxTokens,
     jsonMode: JSON_MODE,
+    reasoningEffort: run.reasoningEffort,
   });
 
   const headers =
@@ -176,12 +180,54 @@ async function callModel({ system, user, temperature, maxTokens }) {
       ? { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' }
       : { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` };
 
-  const res = await fetch(LLM_BASE_URL, { method: 'POST', headers, body: JSON.stringify(body) });
-  const json = await res.json();
-  if (!res.ok) {
-    throw new Error(`${PROVIDER} HTTP ${res.status}: ${JSON.stringify(json).slice(0, 400)}`);
+  // Mirror the workflow's node-level retry (3 tries, 5s apart). Free tiers hand
+  // out 429s and 503s freely — on a shared Gemini model a cold "high demand"
+  // response is routine, not a failure — and a harness that gives up where the
+  // production node would retry is not testing the production path.
+  const MAX_TRIES = 3;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt += 1) {
+    try {
+      const res = await fetch(LLM_BASE_URL, { method: 'POST', headers, body: JSON.stringify(body) });
+      const json = await res.json().catch(() => ({}));
+
+      if (res.ok) {
+        // Truncation and malformed output look the same downstream but need
+        // opposite fixes, so say which one happened rather than leaving it to
+        // be rediscovered.
+        const finish = readFinishReason(PROVIDER, json);
+        if (finish === 'length' || finish === 'max_tokens') {
+          console.log(
+            `  WARNING      model hit the ${maxTokens}-token output cap (finish_reason=${finish}). ` +
+              'Raise PW_MAX_OUTPUT_TOKENS, or set PW_LLM_REASONING_EFFORT=none for a reasoning model.',
+          );
+        }
+        return readCompletionText(PROVIDER, json);
+      }
+
+      // 4xx other than 429 means the request itself is wrong — key, model name,
+      // a rejected field. Retrying cannot fix that, so fail immediately rather
+      // than burning 10 seconds restating the same mistake.
+      const retryable = res.status === 429 || res.status >= 500;
+      const detail = `HTTP ${res.status}: ${JSON.stringify(json).slice(0, 300)}`;
+      if (!retryable) throw new Error(`${PROVIDER} ${detail}`);
+      lastError = new Error(`${PROVIDER} ${detail}`);
+    } catch (err) {
+      // A network-level throw ("fetch failed") has no status and is always
+      // worth retrying.
+      if (err.message && err.message.startsWith(PROVIDER)) throw err;
+      lastError = err;
+    }
+
+    if (attempt < MAX_TRIES) {
+      const waitMs = 5000 * attempt;
+      console.log(`  retry ${attempt}/${MAX_TRIES - 1} in ${waitMs / 1000}s — ${lastError.message.slice(0, 120)}`);
+      await sleep(waitMs);
+    }
   }
-  return readCompletionText(PROVIDER, json);
+
+  throw new Error(`${PROVIDER} failed after ${MAX_TRIES} attempts: ${lastError.message}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -256,17 +302,24 @@ async function produceOne(state) {
   let rules = null;
   let verdict = null;
 
+  // Keep every attempt, not just the one that survived. A post that passed on
+  // the second try because the reviewer caught something on the first is the
+  // most informative artefact this pipeline produces, and throwing it away
+  // leaves only the sanitised result.
+  const attemptLog = [];
+
   while (attempt <= run.maxAttempts) {
     line();
     console.log(`attempt ${attempt} of ${run.maxAttempts}`);
 
     const gen = composeGenerator({ content, run, feedback, prompts: prompts.generator });
-    const completion = await callModel({ ...gen, temperature: 0.7, maxTokens: 1200 });
+    const completion = await callModel({ ...gen, temperature: 0.7, maxTokens: run.maxOutputTokens });
     const parsed = readJsonLoose(completion);
 
     if (!parsed || !parsed.post_text) {
       feedback = 'Rule checks:\n- [GENERATION_FAILED] model did not return JSON containing post_text';
       console.log('  generation   : UNPARSEABLE');
+      attemptLog.push({ attempt, outcome: 'unparseable', post_text: String(completion).slice(0, 600) });
       attempt += 1;
       continue;
     }
@@ -278,6 +331,7 @@ async function produceOne(state) {
     printChecks(rules);
 
     if (!rules.passed) {
+      attemptLog.push({ attempt, outcome: 'rejected-by-rules', post_text: post.post_text, rules });
       feedback = ['Rule checks:', ...rules.violations.map((v) => `- [${v.rule}] ${v.detail}${v.evidence ? ` => "${v.evidence}"` : ''}`)].join('\n');
       attempt += 1;
       continue;
@@ -285,7 +339,7 @@ async function produceOne(state) {
 
     // --- guardrail layer 2 ----------------------------------------------
     const val = composeValidator({ content, post, prompts: prompts.validator });
-    const verdictRaw = await callModel({ ...val, temperature: 0, maxTokens: 800 });
+    const verdictRaw = await callModel({ ...val, temperature: 0, maxTokens: run.maxOutputTokens });
     verdict = parseVerdict(verdictRaw);
     console.log(`  reviewer     : ${verdict.verdict}`);
     for (const v of verdict.reviewerViolations) {
@@ -294,9 +348,11 @@ async function produceOne(state) {
     if (verdict.reviewerNotes) console.log(`  notes        : ${verdict.reviewerNotes}`);
 
     if (verdict.verdict === 'PASS') {
-      return { content, post, rules, verdict, attempts: attempt };
+      attemptLog.push({ attempt, outcome: 'accepted', post_text: post.post_text, rules, verdict });
+      return { content, post, rules, verdict, attempts: attempt, attemptLog };
     }
 
+    attemptLog.push({ attempt, outcome: 'rejected-by-reviewer', post_text: post.post_text, rules, verdict });
     feedback = [
       'Rule checks: (passed)',
       'Reviewer:',
@@ -305,7 +361,7 @@ async function produceOne(state) {
     attempt += 1;
   }
 
-  return { content, post, rules, verdict, attempts: attempt - 1, rejected: true };
+  return { content, post, rules, verdict, attempts: attempt - 1, attemptLog, rejected: true };
 }
 
 // ---------------------------------------------------------------------------

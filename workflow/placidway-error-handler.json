@@ -124,7 +124,7 @@
   "pinData": {},
   "meta": {
     "builtBy": "scripts/build-error-workflow.mjs",
-    "builtAt": "2026-11-10T09:46:54.771Z",
+    "builtAt": "2026-11-10T10:11:53.546Z",
     "note": "Generated file. Set this as the Error Workflow of the main workflow."
   }
 }
