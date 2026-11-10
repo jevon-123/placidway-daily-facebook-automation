@@ -844,7 +844,7 @@ const row = {
   approval_outcome: d.approvalOutcome || 'n/a',
   publish_mode: d.run.publishMode,
   fb_post_id: fbId,
-  status,
+  status: status,
   error: d.rejectionReason || '',
 };
 
