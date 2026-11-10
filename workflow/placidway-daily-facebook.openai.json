@@ -1,0 +1,1262 @@
+{
+  "name": "PlacidWay — Daily Facebook Post (openai)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "pw-001",
+      "name": "Daily Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -620,
+        -120
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "pw-002",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -620,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Single source of truth for every tunable in this workflow.\n// Reads from environment variables so the same export runs in dev and prod.\n// Requires N8N_BLOCK_ENV_ACCESS_IN_NODE=false (see README).\n\nfunction env(key, fallback) {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || value === '' ? fallback : value;\n  } catch (e) {\n    // $env is blocked on this instance — fall back to the documented defaults\n    // so the workflow still runs in simulate mode rather than dying here.\n    return fallback;\n  }\n}\n\nconst bool = (v, d) => (v === undefined ? d : String(v).toLowerCase() === 'true');\n\nconst run = {\n  runId: $execution.id + '-' + Date.now(),\n  runAt: new Date().toISOString(),\n\n  // --- behaviour flags ---------------------------------------------------\n  // publishMode: simulate | schedule | publish\n  //   simulate  = build the post, never call Facebook (default, and what the\n  //               assessment ground rules ask for)\n  //   schedule  = create an unpublished post with scheduled_publish_time\n  //   publish   = post live\n  publishMode: env('PW_PUBLISH_MODE', 'simulate'),\n  // reviewMode: auto | approval\n  reviewMode: env('PW_REVIEW_MODE', 'approval'),\n  allowPriceMention: bool(env('PW_ALLOW_PRICE_MENTION'), false),\n\n  // --- limits ------------------------------------------------------------\n  maxChars: Number(env('PW_MAX_CHARS', 500)),\n  minHashtags: 3,\n  maxHashtags: 5,\n  maxAttempts: Number(env('PW_MAX_ATTEMPTS', 3)),\n  crawlDelaySeconds: Number(env('PW_CRAWL_DELAY_SECONDS', 3)),\n  candidateLimit: Number(env('PW_CANDIDATE_LIMIT', 40)),\n  minBodyLength: Number(env('PW_MIN_BODY_LENGTH', 400)),\n\n  // --- integrations ------------------------------------------------------\n  sheetId: env('PW_SHEET_ID', ''),\n  facebookPageId: env('PW_FB_PAGE_ID', ''),\n  graphVersion: env('PW_FB_GRAPH_VERSION', 'v21.0'),\n  scheduleOffsetMinutes: Number(env('PW_SCHEDULE_OFFSET_MINUTES', 60)),\n  model: env('PW_MODEL', \"gpt-4o-mini\"),\n  userAgent: env('PW_USER_AGENT', 'PlacidWayContentBot/1.0 (+contact in README)'),\n};\n\nreturn [{ json: { run, attempt: 1, feedback: null } }];"
+      },
+      "id": "pw-003",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Variety rule (stretch goal): rotate content types across the week so the\n// Page does not read as four identical article links in a row.\n//\n// Only the two sitemaps whose page structure we have actually verified are in\n// the rotation. Adding 'answer' or 'news' means verifying their JSON-LD first.\nconst SITEMAPS = {\n  article: 'https://www.placidway.com/1/sitemap_articles.xml',\n  package: 'https://www.placidway.com/1/sitemap_packages.xml',\n};\n\n// Sun..Sat — articles carry the week, packages break it up midweek.\nconst SCHEDULE = ['article', 'article', 'package', 'article', 'package', 'article', 'package'];\n\nconst run = $json.run;\nconst override = (() => {\n  try { return $env.PW_FORCE_CONTENT_TYPE || ''; } catch (e) { return ''; }\n})();\n\nconst contentType = SITEMAPS[override] ? override : SCHEDULE[new Date().getUTCDay()];\n\nreturn [{\n  json: {\n    ...$json,\n    run: { ...run, contentType, sitemapUrl: SITEMAPS[contentType] },\n  },\n}];"
+      },
+      "id": "pw-004",
+      "name": "Pick Content Type",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -180,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.run.sitemapUrl }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "sitemapXml"
+            }
+          },
+          "timeout": 60000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $json.run.userAgent }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/xml,text/xml"
+            }
+          ]
+        }
+      },
+      "id": "pw-005",
+      "name": "Fetch Sitemap",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        40,
+        -20
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * PlacidWay content extraction.\n *\n * Self-contained on purpose: no imports, no npm dependencies. The build script\n * (scripts/build-workflow.mjs) injects this file verbatim into the n8n Code\n * nodes, so the logic that is unit-tested locally is byte-for-byte the logic\n * that runs in production.\n */\n\nconst ARTICLE_TYPES = new Set(['Article', 'NewsArticle', 'BlogPosting', 'MedicalWebPage']);\n\n/** Minimal HTML/XML entity decoder — enough for sitemap locs and meta tags. */\nfunction decodeEntities(value) {\n  if (!value) return '';\n  return String(value)\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#0?39;/g, \"'\")\n    .replace(/&apos;/g, \"'\")\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&#(\\d+);/g, (_, code) => String.fromCharCode(Number(code)))\n    .replace(/&amp;/g, '&');\n}\n\nfunction firstMatch(haystack, pattern) {\n  const found = pattern.exec(haystack);\n  return found ? found[1] : null;\n}\n\n/**\n * Parse a sitemap <urlset> into normalised entries, newest first.\n *\n * Deliberately regex-based rather than a full XML parse: PlacidWay's article\n * sitemap is ~2.3 MB of machine-generated, perfectly flat XML and we need only\n * three fields. Building a DOM for it would cost memory and buy us nothing,\n * and the `image:` namespace is awkward in n8n's XML node.\n */\nfunction parseSitemap(xml, options = {}) {\n  const limit = options.limit == null ? 40 : options.limit;\n  const entries = [];\n  const urlBlock = /<url>([\\s\\S]*?)<\\/url>/g;\n\n  let match;\n  while ((match = urlBlock.exec(xml)) !== null) {\n    const block = match[1];\n    const loc = firstMatch(block, /<loc>\\s*([\\s\\S]*?)\\s*<\\/loc>/);\n    if (!loc) continue;\n\n    const image = firstMatch(block, /<image:loc>\\s*([\\s\\S]*?)\\s*<\\/image:loc>/);\n    entries.push({\n      url: decodeEntities(loc),\n      lastmod: firstMatch(block, /<lastmod>\\s*([\\s\\S]*?)\\s*<\\/lastmod>/),\n      sitemapImage: image ? decodeEntities(image) : null,\n    });\n  }\n\n  // lastmod is ISO-8601 (YYYY-MM-DD), so lexical sort === chronological sort.\n  entries.sort((a, b) => String(b.lastmod || '').localeCompare(String(a.lastmod || '')));\n  return limit > 0 ? entries.slice(0, limit) : entries;\n}\n\n/** Pull every <script type=\"application/ld+json\"> payload that parses. */\nfunction extractJsonLd(html) {\n  const blocks = [];\n  const pattern = /<script[^>]*type=[\"']application\\/ld\\+json[\"'][^>]*>([\\s\\S]*?)<\\/script>/gi;\n\n  let match;\n  while ((match = pattern.exec(html)) !== null) {\n    const raw = match[1].trim();\n    if (!raw) continue;\n    try {\n      blocks.push(JSON.parse(raw));\n    } catch {\n      // A malformed block is not fatal: other blocks, and the og: fallback,\n      // can still carry the fields we need.\n    }\n  }\n  return blocks;\n}\n\n/** Flatten @graph wrappers and arrays into a single list of schema.org nodes. */\nfunction flattenGraph(blocks) {\n  const out = [];\n  const visit = (node) => {\n    if (!node || typeof node !== 'object') return;\n    if (Array.isArray(node)) return node.forEach(visit);\n    if (Array.isArray(node['@graph'])) node['@graph'].forEach(visit);\n    if (node['@type']) out.push(node);\n  };\n  blocks.forEach(visit);\n  return out;\n}\n\nfunction typeOf(node) {\n  const t = node['@type'];\n  return Array.isArray(t) ? t[0] : t;\n}\n\n/** schema.org `image` is string | {url} | array of either. */\nfunction imageUrlOf(value) {\n  if (!value) return null;\n  if (typeof value === 'string') return value;\n  if (Array.isArray(value)) return imageUrlOf(value[0]);\n  if (typeof value === 'object') return value.url || value.contentUrl || null;\n  return null;\n}\n\nfunction metaContent(html, attr, name) {\n  const pattern = new RegExp(\n    `<meta[^>]*${attr}=[\"']${name}[\"'][^>]*content=[\"']([^\"']*)[\"']`,\n    'i',\n  );\n  const direct = firstMatch(html, pattern);\n  if (direct) return decodeEntities(direct);\n\n  // Some templates put content= before the name/property attribute.\n  const reversed = new RegExp(\n    `<meta[^>]*content=[\"']([^\"']*)[\"'][^>]*${attr}=[\"']${name}[\"']`,\n    'i',\n  );\n  const flipped = firstMatch(html, reversed);\n  return flipped ? decodeEntities(flipped) : null;\n}\n\n/** Strip tags/scripts from an HTML fragment and collapse whitespace. */\nfunction htmlToText(fragment) {\n  return decodeEntities(\n    fragment\n      .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n      .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n      .replace(/<[^>]+>/g, ' '),\n  )\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\n/**\n * Extract the fields the generator needs from a PlacidWay page.\n *\n * Strategy, in order of preference:\n *   1. JSON-LD (Article.articleBody / Product.offers) — stable, machine-authored.\n *   2. Open Graph meta tags — present on every page, survives template changes.\n *   3. The .pack-inner-content container — last resort for body text only.\n *\n * Returns `null` for anything genuinely absent rather than guessing, so the\n * guardrails downstream can tell \"no price\" apart from \"price unknown\".\n */\nfunction extractContent(html, context = {}) {\n  const nodes = flattenGraph(extractJsonLd(html));\n\n  const article = nodes.find(\n    (n) => ARTICLE_TYPES.has(typeOf(n)) && (n.articleBody || n.description),\n  );\n  const product = nodes.find((n) => typeOf(n) === 'Product');\n  const primary = article || product || null;\n\n  const offers = product && product.offers ? product.offers : null;\n  const rawPrice = offers ? offers.price : null;\n  const price = rawPrice == null || rawPrice === '' ? null : Number(rawPrice);\n\n  let body = article && article.articleBody ? String(article.articleBody) : '';\n  if (!body) {\n    const container = firstMatch(\n      html,\n      /<div[^>]*class=[\"'][^\"']*pack-inner-content[^\"']*[\"'][^>]*>([\\s\\S]*?)<\\/div>\\s*<\\/(?:main|section|article)>/i,\n    );\n    if (container) body = htmlToText(container);\n  }\n  body = body.replace(/\\s+/g, ' ').trim();\n\n  const title =\n    (primary && (primary.headline || primary.name)) ||\n    metaContent(html, 'property', 'og:title') ||\n    decodeEntities(firstMatch(html, /<title>([\\s\\S]*?)<\\/title>/i) || '') ||\n    null;\n\n  const summary =\n    (primary && primary.description) ||\n    metaContent(html, 'property', 'og:description') ||\n    metaContent(html, 'name', 'description') ||\n    null;\n\n  const image =\n    metaContent(html, 'property', 'og:image') ||\n    (primary && imageUrlOf(primary.image)) ||\n    context.sitemapImage ||\n    null;\n\n  return {\n    contentType: context.contentType || (product ? 'package' : 'article'),\n    url: context.url || (primary && primary.url) || metaContent(html, 'property', 'og:url') || null,\n    title: title ? title.trim() : null,\n    summary: summary ? summary.trim() : null,\n    body,\n    bodyLength: body.length,\n    image,\n    datePublished: (primary && primary.datePublished) || null,\n    dateModified: (primary && primary.dateModified) || context.lastmod || null,\n    author: primary && primary.author ? primary.author.name || null : null,\n    provider: product && product.brand ? product.brand.name || null : null,\n    price,\n    priceCurrency: offers ? offers.priceCurrency || null : null,\n    // Everything the post is allowed to assert must be findable in here.\n    sourceText: [title, summary, body].filter(Boolean).join('\\n\\n'),\n    extractedBy: article ? 'json-ld:Article' : product ? 'json-ld:Product' : 'opengraph-fallback',\n  };\n}\n\n/**\n * Is this item usable? Guards against half-rendered pages and stubs, which\n * would otherwise give the LLM nothing to ground itself in.\n */\nfunction isUsable(content, minBodyLength = 400) {\n  const problems = [];\n  if (!content.title) problems.push('missing title');\n  if (!content.url) problems.push('missing url');\n  if (!content.summary && content.bodyLength < minBodyLength) problems.push('no summary and body too short');\n  if (content.bodyLength < minBodyLength) problems.push(`body ${content.bodyLength} < ${minBodyLength} chars`);\n  return { usable: problems.length === 0, problems };\n}\n\n// ---- node driver ----------------------------------------------------------\n// Emits exactly ONE item carrying the whole candidate list, so the Google\n// Sheets read below runs once rather than once per candidate.\nconst run = $('Pick Content Type').first().json.run;\nconst xml = $input.first().json.sitemapXml || '';\n\nif (!xml || xml.indexOf('<url>') === -1) {\n  throw new Error('Sitemap fetch returned no <url> entries for ' + run.sitemapUrl);\n}\n\nconst candidates = parseSitemap(xml, { limit: run.candidateLimit });\nif (candidates.length === 0) {\n  throw new Error('Sitemap parsed but produced zero candidates: ' + run.sitemapUrl);\n}\n\nreturn [{\n  json: {\n    ...$('Pick Content Type').first().json,\n    candidates,\n    candidateCount: candidates.length,\n  },\n}];"
+      },
+      "id": "pw-006",
+      "name": "Parse Sitemap",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $json.run.sheetId }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "runs",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "pw-007",
+      "name": "Load Posted Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        480,
+        -20
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PW_GOOGLE_SHEETS",
+          "name": "PlacidWay Google Sheets"
+        }
+      },
+      "notes": "Reads every row of the run log. Fails loudly: if we cannot read what was already posted, we must not post."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Picks the newest candidate whose URL has never reached Facebook.\n//\n// \"Reached Facebook\" means a prior run ended in published, scheduled or\n// simulated. Rows that ended in failed or rejected are deliberately NOT\n// treated as used, so a transient outage does not burn a piece of content.\nconst base = $('Parse Sitemap').first().json;\nconst candidates = base.candidates || [];\n\nconst USED_STATUSES = new Set(['published', 'scheduled', 'simulated']);\n\nconst rows = $input.all().map((i) => i.json).filter((r) => r && (r.url || r.URL));\nconst used = new Set(\n  rows\n    .filter((r) => USED_STATUSES.has(String(r.status || '').toLowerCase()))\n    .map((r) => String(r.url || r.URL).trim())\n    .filter(Boolean),\n);\n\nconst item = candidates.find((c) => !used.has(c.url));\n\nif (!item) {\n  throw new Error(\n    'No unposted ' + base.run.contentType + ' left in the newest ' +\n    candidates.length + ' sitemap entries (' + used.size + ' already used). ' +\n    'Raise PW_CANDIDATE_LIMIT or let the rotation move to another content type.'\n  );\n}\n\nreturn [{ json: { ...base, item, alreadyUsedCount: used.size } }];"
+      },
+      "id": "pw-008",
+      "name": "Choose Unposted Item",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json.run.crawlDelaySeconds }}",
+        "unit": "seconds"
+      },
+      "id": "pw-009",
+      "name": "Respect Crawl Delay",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        920,
+        -20
+      ],
+      "webhookId": "a1f0c4de-0000-4000-8000-000000000001",
+      "notes": "robots.txt sets Crawl-delay: 3, which is stricter than the brief's 1 req/s. We honour the stricter number."
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.item.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "html"
+            }
+          },
+          "timeout": 60000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $json.run.userAgent }}"
+            },
+            {
+              "name": "Accept",
+              "value": "text/html"
+            }
+          ]
+        }
+      },
+      "id": "pw-010",
+      "name": "Fetch Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        -20
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * PlacidWay content extraction.\n *\n * Self-contained on purpose: no imports, no npm dependencies. The build script\n * (scripts/build-workflow.mjs) injects this file verbatim into the n8n Code\n * nodes, so the logic that is unit-tested locally is byte-for-byte the logic\n * that runs in production.\n */\n\nconst ARTICLE_TYPES = new Set(['Article', 'NewsArticle', 'BlogPosting', 'MedicalWebPage']);\n\n/** Minimal HTML/XML entity decoder — enough for sitemap locs and meta tags. */\nfunction decodeEntities(value) {\n  if (!value) return '';\n  return String(value)\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#0?39;/g, \"'\")\n    .replace(/&apos;/g, \"'\")\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&#(\\d+);/g, (_, code) => String.fromCharCode(Number(code)))\n    .replace(/&amp;/g, '&');\n}\n\nfunction firstMatch(haystack, pattern) {\n  const found = pattern.exec(haystack);\n  return found ? found[1] : null;\n}\n\n/**\n * Parse a sitemap <urlset> into normalised entries, newest first.\n *\n * Deliberately regex-based rather than a full XML parse: PlacidWay's article\n * sitemap is ~2.3 MB of machine-generated, perfectly flat XML and we need only\n * three fields. Building a DOM for it would cost memory and buy us nothing,\n * and the `image:` namespace is awkward in n8n's XML node.\n */\nfunction parseSitemap(xml, options = {}) {\n  const limit = options.limit == null ? 40 : options.limit;\n  const entries = [];\n  const urlBlock = /<url>([\\s\\S]*?)<\\/url>/g;\n\n  let match;\n  while ((match = urlBlock.exec(xml)) !== null) {\n    const block = match[1];\n    const loc = firstMatch(block, /<loc>\\s*([\\s\\S]*?)\\s*<\\/loc>/);\n    if (!loc) continue;\n\n    const image = firstMatch(block, /<image:loc>\\s*([\\s\\S]*?)\\s*<\\/image:loc>/);\n    entries.push({\n      url: decodeEntities(loc),\n      lastmod: firstMatch(block, /<lastmod>\\s*([\\s\\S]*?)\\s*<\\/lastmod>/),\n      sitemapImage: image ? decodeEntities(image) : null,\n    });\n  }\n\n  // lastmod is ISO-8601 (YYYY-MM-DD), so lexical sort === chronological sort.\n  entries.sort((a, b) => String(b.lastmod || '').localeCompare(String(a.lastmod || '')));\n  return limit > 0 ? entries.slice(0, limit) : entries;\n}\n\n/** Pull every <script type=\"application/ld+json\"> payload that parses. */\nfunction extractJsonLd(html) {\n  const blocks = [];\n  const pattern = /<script[^>]*type=[\"']application\\/ld\\+json[\"'][^>]*>([\\s\\S]*?)<\\/script>/gi;\n\n  let match;\n  while ((match = pattern.exec(html)) !== null) {\n    const raw = match[1].trim();\n    if (!raw) continue;\n    try {\n      blocks.push(JSON.parse(raw));\n    } catch {\n      // A malformed block is not fatal: other blocks, and the og: fallback,\n      // can still carry the fields we need.\n    }\n  }\n  return blocks;\n}\n\n/** Flatten @graph wrappers and arrays into a single list of schema.org nodes. */\nfunction flattenGraph(blocks) {\n  const out = [];\n  const visit = (node) => {\n    if (!node || typeof node !== 'object') return;\n    if (Array.isArray(node)) return node.forEach(visit);\n    if (Array.isArray(node['@graph'])) node['@graph'].forEach(visit);\n    if (node['@type']) out.push(node);\n  };\n  blocks.forEach(visit);\n  return out;\n}\n\nfunction typeOf(node) {\n  const t = node['@type'];\n  return Array.isArray(t) ? t[0] : t;\n}\n\n/** schema.org `image` is string | {url} | array of either. */\nfunction imageUrlOf(value) {\n  if (!value) return null;\n  if (typeof value === 'string') return value;\n  if (Array.isArray(value)) return imageUrlOf(value[0]);\n  if (typeof value === 'object') return value.url || value.contentUrl || null;\n  return null;\n}\n\nfunction metaContent(html, attr, name) {\n  const pattern = new RegExp(\n    `<meta[^>]*${attr}=[\"']${name}[\"'][^>]*content=[\"']([^\"']*)[\"']`,\n    'i',\n  );\n  const direct = firstMatch(html, pattern);\n  if (direct) return decodeEntities(direct);\n\n  // Some templates put content= before the name/property attribute.\n  const reversed = new RegExp(\n    `<meta[^>]*content=[\"']([^\"']*)[\"'][^>]*${attr}=[\"']${name}[\"']`,\n    'i',\n  );\n  const flipped = firstMatch(html, reversed);\n  return flipped ? decodeEntities(flipped) : null;\n}\n\n/** Strip tags/scripts from an HTML fragment and collapse whitespace. */\nfunction htmlToText(fragment) {\n  return decodeEntities(\n    fragment\n      .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n      .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n      .replace(/<[^>]+>/g, ' '),\n  )\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\n/**\n * Extract the fields the generator needs from a PlacidWay page.\n *\n * Strategy, in order of preference:\n *   1. JSON-LD (Article.articleBody / Product.offers) — stable, machine-authored.\n *   2. Open Graph meta tags — present on every page, survives template changes.\n *   3. The .pack-inner-content container — last resort for body text only.\n *\n * Returns `null` for anything genuinely absent rather than guessing, so the\n * guardrails downstream can tell \"no price\" apart from \"price unknown\".\n */\nfunction extractContent(html, context = {}) {\n  const nodes = flattenGraph(extractJsonLd(html));\n\n  const article = nodes.find(\n    (n) => ARTICLE_TYPES.has(typeOf(n)) && (n.articleBody || n.description),\n  );\n  const product = nodes.find((n) => typeOf(n) === 'Product');\n  const primary = article || product || null;\n\n  const offers = product && product.offers ? product.offers : null;\n  const rawPrice = offers ? offers.price : null;\n  const price = rawPrice == null || rawPrice === '' ? null : Number(rawPrice);\n\n  let body = article && article.articleBody ? String(article.articleBody) : '';\n  if (!body) {\n    const container = firstMatch(\n      html,\n      /<div[^>]*class=[\"'][^\"']*pack-inner-content[^\"']*[\"'][^>]*>([\\s\\S]*?)<\\/div>\\s*<\\/(?:main|section|article)>/i,\n    );\n    if (container) body = htmlToText(container);\n  }\n  body = body.replace(/\\s+/g, ' ').trim();\n\n  const title =\n    (primary && (primary.headline || primary.name)) ||\n    metaContent(html, 'property', 'og:title') ||\n    decodeEntities(firstMatch(html, /<title>([\\s\\S]*?)<\\/title>/i) || '') ||\n    null;\n\n  const summary =\n    (primary && primary.description) ||\n    metaContent(html, 'property', 'og:description') ||\n    metaContent(html, 'name', 'description') ||\n    null;\n\n  const image =\n    metaContent(html, 'property', 'og:image') ||\n    (primary && imageUrlOf(primary.image)) ||\n    context.sitemapImage ||\n    null;\n\n  return {\n    contentType: context.contentType || (product ? 'package' : 'article'),\n    url: context.url || (primary && primary.url) || metaContent(html, 'property', 'og:url') || null,\n    title: title ? title.trim() : null,\n    summary: summary ? summary.trim() : null,\n    body,\n    bodyLength: body.length,\n    image,\n    datePublished: (primary && primary.datePublished) || null,\n    dateModified: (primary && primary.dateModified) || context.lastmod || null,\n    author: primary && primary.author ? primary.author.name || null : null,\n    provider: product && product.brand ? product.brand.name || null : null,\n    price,\n    priceCurrency: offers ? offers.priceCurrency || null : null,\n    // Everything the post is allowed to assert must be findable in here.\n    sourceText: [title, summary, body].filter(Boolean).join('\\n\\n'),\n    extractedBy: article ? 'json-ld:Article' : product ? 'json-ld:Product' : 'opengraph-fallback',\n  };\n}\n\n/**\n * Is this item usable? Guards against half-rendered pages and stubs, which\n * would otherwise give the LLM nothing to ground itself in.\n */\nfunction isUsable(content, minBodyLength = 400) {\n  const problems = [];\n  if (!content.title) problems.push('missing title');\n  if (!content.url) problems.push('missing url');\n  if (!content.summary && content.bodyLength < minBodyLength) problems.push('no summary and body too short');\n  if (content.bodyLength < minBodyLength) problems.push(`body ${content.bodyLength} < ${minBodyLength} chars`);\n  return { usable: problems.length === 0, problems };\n}\n\n// ---- node driver ----------------------------------------------------------\nconst base = $('Choose Unposted Item').first().json;\nconst html = $input.first().json.html || '';\n\nconst content = extractContent(html, {\n  url: base.item.url,\n  contentType: base.run.contentType,\n  sitemapImage: base.item.sitemapImage,\n  lastmod: base.item.lastmod,\n});\n\nconst usability = isUsable(content, base.run.minBodyLength);\n\n// Trim the body before it reaches the model. The full articleBody runs to 22 kB;\n// the first ~6 kB carries the lede and the substantive points, and capping it\n// keeps token cost predictable without starving the grounding check.\nconst MODEL_BODY_LIMIT = 6000;\n\nreturn [{\n  json: {\n    ...base,\n    content: { ...content, bodyForModel: content.body.slice(0, MODEL_BODY_LIMIT) },\n    usable: usability.usable,\n    usabilityProblems: usability.problems,\n  },\n}];"
+      },
+      "id": "pw-011",
+      "name": "Extract Content",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "pw-012",
+              "leftValue": "={{ $json.usable }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "pw-013",
+      "name": "Usable Content?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1580,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Prompt assembly and provider plumbing.\n *\n * Shared by three callers that must never disagree:\n *   - the n8n \"Build Generator Request\" / \"Build Validator Request\" Code nodes\n *     (this file is inlined into them at build time)\n *   - scripts/dry-run.mjs, the local harness\n *   - scripts/make-samples.mjs, which produces the sample output deliverable\n *\n * Self-contained: no imports. Prompt text is passed in, not read from disk,\n * because an n8n Code node has no filesystem.\n */\n\n/** Substitute every {{PLACEHOLDER}} present in `vars`. Unknown ones are left alone. */\nfunction fillTemplate(template, vars) {\n  let out = String(template);\n  for (const [key, value] of Object.entries(vars)) {\n    out = out.split(`{{${key}}}`).join(value == null ? '' : String(value));\n  }\n  return out;\n}\n\n/**\n * The price instruction is the single most load-bearing line in the generator\n * prompt, so it is built explicitly rather than interpolated inline.\n *\n * Three distinct states, and they must not be collapsed:\n *   - the page lists a price and we are allowed to cite it (exactly, unchanged)\n *   - the page lists a price and we are not allowed to cite it\n *   - the page lists no price at all\n */\nfunction priceInstruction(content, allowPriceMention) {\n  if (content.price == null) {\n    return 'Listed price: none published on this page — you MUST NOT mention any price or cost figure.';\n  }\n  const figure = `${content.price} ${content.priceCurrency || ''}`.trim();\n  return allowPriceMention\n    ? `Listed price: ${figure} — you MAY cite this exact figure, unchanged and in full. No other number, and no \"from\"/\"starting at\" framing.`\n    : `Listed price: ${figure} — this is for your context only. You MUST NOT mention any price or cost figure in the post.`;\n}\n\nfunction retryFeedbackBlock(feedback) {\n  if (!feedback) return '';\n  return [\n    'YOUR PREVIOUS ATTEMPT WAS REJECTED BY THE GUARDRAILS.',\n    feedback,\n    'Rewrite the post from scratch and fix every point above. Do not argue with the rejection.',\n  ].join('\\n');\n}\n\n/** Build the generator's system + user messages. */\nfunction composeGenerator({ content, run, feedback, prompts }) {\n  const system = fillTemplate(prompts.system, { MAX_CHARS: run.maxChars });\n  const user = fillTemplate(prompts.user, {\n    CONTENT_TYPE: content.contentType,\n    TITLE: content.title,\n    URL: content.url,\n    PROVIDER: content.provider || 'PlacidWay marketplace listing',\n    PRICE_LINE: priceInstruction(content, run.allowPriceMention),\n    SUMMARY: content.summary || '(none)',\n    BODY: content.bodyForModel || content.body || '',\n    RETRY_FEEDBACK: retryFeedbackBlock(feedback),\n  });\n  return { system, user };\n}\n\n/**\n * Build the reviewer's system + user messages.\n *\n * Note what is absent: the generator's `grounding_notes` and `hook`/`cta`\n * breakdown. The reviewer is given the source and the finished post, nothing\n * else. Showing it the author's own justification turns an independent check\n * into a rubber stamp.\n */\nfunction composeValidator({ content, post, prompts }) {\n  const user = fillTemplate(prompts.user, {\n    TITLE: content.title,\n    URL: content.url,\n    PRICE_LINE:\n      content.price == null\n        ? 'The source page publishes no price.'\n        : `Listed price on the source page: ${content.price} ${content.priceCurrency || ''}`.trim(),\n    SUMMARY: content.summary || '(none)',\n    BODY: content.bodyForModel || content.body || '',\n    POST_TEXT: post.post_text || '',\n  });\n  return { system: prompts.system, user };\n}\n\n/** Shape the request body for whichever provider is configured. */\nfunction toProviderBody(provider, { system, user, model, temperature, maxTokens, jsonMode }) {\n  if (provider === 'anthropic') {\n    return {\n      model,\n      max_tokens: maxTokens,\n      temperature,\n      system,\n      messages: [{ role: 'user', content: user }],\n    };\n  }\n  const body = {\n    model,\n    temperature,\n    max_tokens: maxTokens,\n    messages: [\n      { role: 'system', content: system },\n      { role: 'user', content: user },\n    ],\n  };\n  if (jsonMode) body.response_format = { type: 'json_object' };\n  return body;\n}\n\n/** Pull the assistant text out of a provider response. */\nfunction readCompletionText(provider, response) {\n  if (!response) return '';\n  if (provider === 'anthropic') {\n    const block = (response.content || [])[0] || {};\n    return block.text || '';\n  }\n  const choice = (response.choices || [])[0] || {};\n  return (choice.message || {}).content || '';\n}\n\n/**\n * Parse JSON out of a model response that may be fenced or wrapped in prose.\n * Returns null rather than throwing — callers treat null as a failed attempt.\n */\nfunction readJsonLoose(text) {\n  const raw = String(text || '').trim();\n  if (!raw) return null;\n  try {\n    return JSON.parse(raw);\n  } catch {\n    /* fall through */\n  }\n  const fenced = /```(?:json)?\\s*([\\s\\S]*?)```/.exec(raw);\n  const braced = /\\{[\\s\\S]*\\}/.exec(raw);\n  const candidate = (fenced && fenced[1]) || (braced && braced[0]);\n  if (!candidate) return null;\n  try {\n    return JSON.parse(candidate);\n  } catch {\n    return null;\n  }\n}\n\n/**\n * The model sometimes puts the link or hashtags only in the structured fields\n * and omits them from post_text. Repair rather than reject: the guardrails\n * still get the final say on whatever comes out of here.\n */\nfunction normalisePost(post, content) {\n  let text = String(post.post_text || '').trim();\n  if (!text) return { ...post, post_text: '' };\n\n  if (content.url && !text.includes(content.url)) {\n    text += `\\n${content.url}`;\n  }\n  const tags = Array.isArray(post.hashtags) ? post.hashtags : [];\n  if (tags.length && !/#[\\p{L}\\p{N}_]+/u.test(text)) {\n    text += `\\n${tags.join(' ')}`;\n  }\n  return { ...post, post_text: text };\n}\n\n// ---- node driver ----------------------------------------------------------\n// The prompt is assembled in JS, not in an n8n expression. These are\n// multi-paragraph templates and escaping them inside an expression string is\n// exactly where this kind of workflow breaks.\n//\n// composeGenerator() is the same function scripts/dry-run.mjs calls, inlined\n// here by the build. The local harness and the production node cannot drift.\nconst d = $json;\nconst prompts = { system: \"You are the social media copywriter for PlacidWay, a medical tourism marketplace\\nthat connects patients with clinics and treatment packages worldwide.\\n\\nYou write one Facebook post about one PlacidWay page. Your audience is a patient\\nor a family member who is researching care abroad and is anxious about cost,\\nquality and logistics. Write to them as a well-informed friend would: calm,\\nconcrete, respectful. Never as an advertiser.\\n\\n## Non-negotiable rules\\n\\n1. **Grounding.** Every factual statement must be traceable to the SOURCE\\n   section below. If the source does not say it, you may not write it. When in\\n   doubt, leave it out and stay general.\\n2. **No medical claims.** Never state or imply that a treatment cures, heals,\\n   fixes, guarantees, or will produce any clinical outcome. Never use: cure,\\n   guaranteed, risk-free, painless, pain-free, no side effects, miracle,\\n   permanent solution, proven to heal, instant relief, 100% safe/effective.\\n3. **No superlatives.** No \\\"the best clinic\\\", \\\"#1\\\", \\\"world's leading\\\", \\\"safest\\\".\\n   PlacidWay is a marketplace; it does not rank its providers in social copy.\\n4. **No invented numbers.** Do not state prices, success rates, percentages,\\n   durations or counts unless that exact figure appears in the SOURCE. Prefer no\\n   number at all over an approximate one.\\n5. **No individual medical advice.** Never tell the reader what they should\\n   undergo. You may invite them to read, compare, or ask.\\n6. **No fabricated endorsement.** Do not quote patients, doctors or awards.\\n\\n## Required shape\\n\\n- A **hook**: one line, max ~90 characters, that names the real question or\\n  tension the page addresses. No clickbait, no \\\"You won't believe\\\".\\n- **2 to 4 value lines**: each one short, each one carrying a distinct fact or\\n  consideration drawn from the source. No padding.\\n- A **call to action**: one line inviting the reader to read or compare. Soft.\\n- The **link**, exactly as given, on its own line.\\n- **3 to 5 hashtags** on the final line. Relevant to the treatment, destination\\n  or audience. CamelCase, no spaces, no duplicates.\\n\\nEverything before the link must be **under {{MAX_CHARS}} characters**. Count it.\\nAim for 350–450 so you have margin.\\n\\nUp to 2 tasteful emoji are allowed. Zero is also fine. Never more than 2.\\n\\n## Output format\\n\\nReturn **only** a JSON object, no prose and no code fences:\\n\\n```\\n{\\n  \\\"hook\\\": \\\"...\\\",\\n  \\\"value_lines\\\": [\\\"...\\\", \\\"...\\\"],\\n  \\\"cta\\\": \\\"...\\\",\\n  \\\"hashtags\\\": [\\\"#One\\\", \\\"#Two\\\", \\\"#Three\\\"],\\n  \\\"post_text\\\": \\\"the complete post exactly as it should appear on Facebook, including the hook, value lines, CTA, the link on its own line, and the hashtags on the final line\\\",\\n  \\\"grounding_notes\\\": [\\\"which part of the source each value line came from\\\"]\\n}\\n```\\n\\n`post_text` is what gets published. The other fields exist so a reviewer can see\\nyour reasoning. `grounding_notes` must have one entry per value line.\", user: \"SOURCE — this is the only material you may draw on.\\n\\nContent type: {{CONTENT_TYPE}}\\nTitle: {{TITLE}}\\nCanonical URL: {{URL}}\\nProvider: {{PROVIDER}}\\n{{PRICE_LINE}}\\n\\nSummary:\\n{{SUMMARY}}\\n\\nBody:\\n{{BODY}}\\n\\n---\\n\\n{{RETRY_FEEDBACK}}\\n\\nWrite the post now. Return only the JSON object.\" };\n\nconst { system, user } = composeGenerator({\n  content: d.content,\n  run: d.run,\n  feedback: d.feedback,\n  prompts,\n});\n\nconst body = toProviderBody(\"openai\", {\n  system,\n  user,\n  model: d.run.model,\n  temperature: 0.7,\n  maxTokens: 1200,\n  jsonMode: true,\n});\n\nreturn [{ json: { ...d, body } }];"
+      },
+      "id": "pw-014",
+      "name": "Build Generator Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "pw-015",
+      "name": "Generate Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2020,
+        -120
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PW_OPENAI",
+          "name": "OpenAI API key (Authorization: Bearer)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Prompt assembly and provider plumbing.\n *\n * Shared by three callers that must never disagree:\n *   - the n8n \"Build Generator Request\" / \"Build Validator Request\" Code nodes\n *     (this file is inlined into them at build time)\n *   - scripts/dry-run.mjs, the local harness\n *   - scripts/make-samples.mjs, which produces the sample output deliverable\n *\n * Self-contained: no imports. Prompt text is passed in, not read from disk,\n * because an n8n Code node has no filesystem.\n */\n\n/** Substitute every {{PLACEHOLDER}} present in `vars`. Unknown ones are left alone. */\nfunction fillTemplate(template, vars) {\n  let out = String(template);\n  for (const [key, value] of Object.entries(vars)) {\n    out = out.split(`{{${key}}}`).join(value == null ? '' : String(value));\n  }\n  return out;\n}\n\n/**\n * The price instruction is the single most load-bearing line in the generator\n * prompt, so it is built explicitly rather than interpolated inline.\n *\n * Three distinct states, and they must not be collapsed:\n *   - the page lists a price and we are allowed to cite it (exactly, unchanged)\n *   - the page lists a price and we are not allowed to cite it\n *   - the page lists no price at all\n */\nfunction priceInstruction(content, allowPriceMention) {\n  if (content.price == null) {\n    return 'Listed price: none published on this page — you MUST NOT mention any price or cost figure.';\n  }\n  const figure = `${content.price} ${content.priceCurrency || ''}`.trim();\n  return allowPriceMention\n    ? `Listed price: ${figure} — you MAY cite this exact figure, unchanged and in full. No other number, and no \"from\"/\"starting at\" framing.`\n    : `Listed price: ${figure} — this is for your context only. You MUST NOT mention any price or cost figure in the post.`;\n}\n\nfunction retryFeedbackBlock(feedback) {\n  if (!feedback) return '';\n  return [\n    'YOUR PREVIOUS ATTEMPT WAS REJECTED BY THE GUARDRAILS.',\n    feedback,\n    'Rewrite the post from scratch and fix every point above. Do not argue with the rejection.',\n  ].join('\\n');\n}\n\n/** Build the generator's system + user messages. */\nfunction composeGenerator({ content, run, feedback, prompts }) {\n  const system = fillTemplate(prompts.system, { MAX_CHARS: run.maxChars });\n  const user = fillTemplate(prompts.user, {\n    CONTENT_TYPE: content.contentType,\n    TITLE: content.title,\n    URL: content.url,\n    PROVIDER: content.provider || 'PlacidWay marketplace listing',\n    PRICE_LINE: priceInstruction(content, run.allowPriceMention),\n    SUMMARY: content.summary || '(none)',\n    BODY: content.bodyForModel || content.body || '',\n    RETRY_FEEDBACK: retryFeedbackBlock(feedback),\n  });\n  return { system, user };\n}\n\n/**\n * Build the reviewer's system + user messages.\n *\n * Note what is absent: the generator's `grounding_notes` and `hook`/`cta`\n * breakdown. The reviewer is given the source and the finished post, nothing\n * else. Showing it the author's own justification turns an independent check\n * into a rubber stamp.\n */\nfunction composeValidator({ content, post, prompts }) {\n  const user = fillTemplate(prompts.user, {\n    TITLE: content.title,\n    URL: content.url,\n    PRICE_LINE:\n      content.price == null\n        ? 'The source page publishes no price.'\n        : `Listed price on the source page: ${content.price} ${content.priceCurrency || ''}`.trim(),\n    SUMMARY: content.summary || '(none)',\n    BODY: content.bodyForModel || content.body || '',\n    POST_TEXT: post.post_text || '',\n  });\n  return { system: prompts.system, user };\n}\n\n/** Shape the request body for whichever provider is configured. */\nfunction toProviderBody(provider, { system, user, model, temperature, maxTokens, jsonMode }) {\n  if (provider === 'anthropic') {\n    return {\n      model,\n      max_tokens: maxTokens,\n      temperature,\n      system,\n      messages: [{ role: 'user', content: user }],\n    };\n  }\n  const body = {\n    model,\n    temperature,\n    max_tokens: maxTokens,\n    messages: [\n      { role: 'system', content: system },\n      { role: 'user', content: user },\n    ],\n  };\n  if (jsonMode) body.response_format = { type: 'json_object' };\n  return body;\n}\n\n/** Pull the assistant text out of a provider response. */\nfunction readCompletionText(provider, response) {\n  if (!response) return '';\n  if (provider === 'anthropic') {\n    const block = (response.content || [])[0] || {};\n    return block.text || '';\n  }\n  const choice = (response.choices || [])[0] || {};\n  return (choice.message || {}).content || '';\n}\n\n/**\n * Parse JSON out of a model response that may be fenced or wrapped in prose.\n * Returns null rather than throwing — callers treat null as a failed attempt.\n */\nfunction readJsonLoose(text) {\n  const raw = String(text || '').trim();\n  if (!raw) return null;\n  try {\n    return JSON.parse(raw);\n  } catch {\n    /* fall through */\n  }\n  const fenced = /```(?:json)?\\s*([\\s\\S]*?)```/.exec(raw);\n  const braced = /\\{[\\s\\S]*\\}/.exec(raw);\n  const candidate = (fenced && fenced[1]) || (braced && braced[0]);\n  if (!candidate) return null;\n  try {\n    return JSON.parse(candidate);\n  } catch {\n    return null;\n  }\n}\n\n/**\n * The model sometimes puts the link or hashtags only in the structured fields\n * and omits them from post_text. Repair rather than reject: the guardrails\n * still get the final say on whatever comes out of here.\n */\nfunction normalisePost(post, content) {\n  let text = String(post.post_text || '').trim();\n  if (!text) return { ...post, post_text: '' };\n\n  if (content.url && !text.includes(content.url)) {\n    text += `\\n${content.url}`;\n  }\n  const tags = Array.isArray(post.hashtags) ? post.hashtags : [];\n  if (tags.length && !/#[\\p{L}\\p{N}_]+/u.test(text)) {\n    text += `\\n${tags.join(' ')}`;\n  }\n  return { ...post, post_text: text };\n}\n\n// ---- node driver ----------------------------------------------------------\nconst base = $('Build Generator Request').first().json;\nconst raw = readCompletionText(\"openai\", $input.first().json);\nconst parsed = readJsonLoose(raw);\n\nif (!parsed || !parsed.post_text) {\n  // An unreadable generation is a failed attempt, not a crash. Hand it to the\n  // rule checker with an explicit violation so the retry loop picks it up and\n  // the reason lands in the run log.\n  return [{\n    json: {\n      ...base,\n      post: { post_text: '' },\n      generationError: 'Model did not return usable JSON containing post_text.',\n      rawCompletion: String(raw).slice(0, 2000),\n      body: undefined,\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    ...base,\n    post: normalisePost(parsed, base.content),\n    body: undefined,\n  },\n}];"
+      },
+      "id": "pw-016",
+      "name": "Parse Generated Post",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Layer 1 of the guardrail: deterministic, rule-based checks.\n *\n * This layer exists to catch everything that does NOT need judgement — length,\n * hashtag count, link integrity, forbidden claim phrases, and above all whether\n * every number in the post can be found in the source page. It is cheap,\n * reproducible, and it fails closed.\n *\n * Layer 2 (an independent LLM reviewer, see prompts/validator.md) catches what\n * regex cannot: implied promises, tonal over-reach, and facts that are phrased\n * plausibly but are simply not on the page.\n *\n * Self-contained by design — injected verbatim into an n8n Code node.\n */\n\n/**\n * Hard failures. These are promises and claims a medical-tourism marketplace\n * must never publish, regardless of what the source page says.\n *\n * Note what is deliberately NOT here: topic words like \"cost\", \"success rate\",\n * \"treatment\" or \"recovery\". PlacidWay's own article titles contain them\n * (\"IVF in Mexico vs USA: Cost & Success Rates\"), so banning them would reject\n * accurate posts. We ban the *claim*, not the *subject*.\n */\nconst PROHIBITED = [\n  { id: 'CURE', pattern: /\\b(cure[sd]?|curing)\\b/i, why: 'claims a cure' },\n  { id: 'GUARANTEE', pattern: /\\b(guarantee[sd]?|guaranteeing)\\b/i, why: 'promises an outcome' },\n  { id: 'ABSOLUTE_PCT', pattern: /\\b100\\s*%\\s*(safe|effective|success|painless|guaranteed)\\b/i, why: 'absolute safety/efficacy claim' },\n  { id: 'RISK_FREE', pattern: /\\brisk[\\s-]?free\\b/i, why: 'denies clinical risk' },\n  { id: 'PAINLESS', pattern: /\\b(painless|pain[\\s-]?free)\\b/i, why: 'promises a pain-free experience' },\n  { id: 'NO_SIDE_EFFECTS', pattern: /\\b(no side[\\s-]?effects?|side[\\s-]?effect[\\s-]?free)\\b/i, why: 'denies side effects' },\n  { id: 'MIRACLE', pattern: /\\bmiracle|miraculous\\b/i, why: 'sensationalises treatment' },\n  { id: 'PERMANENT_FIX', pattern: /\\bpermanent(ly)?\\s+(cure|fix|solution|relief)\\b/i, why: 'promises permanence' },\n  { id: 'PROVEN_TO', pattern: /\\bproven\\s+to\\s+(cure|heal|eliminate|reverse|restore)\\b/i, why: 'unsupported efficacy claim' },\n  { id: 'WILL_OUTCOME', pattern: /\\b(will|guarantees?\\s+to)\\s+(cure|heal|fix|eliminate|reverse|restore)\\b/i, why: 'promises a clinical outcome' },\n  { id: 'SUPERLATIVE', pattern: /\\b(the\\s+(best|safest|top)\\s+\\w+|#\\s?1\\b|\\bnumber\\s+one\\b|world'?s\\s+(best|leading|top))/i, why: 'unverifiable superlative' },\n  { id: 'INSTANT', pattern: /\\binstant(ly)?\\s+(relief|results?|recovery)\\b/i, why: 'promises instant results' },\n  { id: 'ELIMINATES', pattern: /\\b(eliminates?|reverses?|removes?)\\s+(all\\s+)?(pain|cancer|disease|illness)\\b/i, why: 'promises disease elimination' },\n  { id: 'MEDICAL_ADVICE', pattern: /\\byou\\s+(should|must|need to)\\s+(get|have|undergo|take)\\b/i, why: 'gives individual medical advice' },\n];\n\n/** Soft signals. Logged and shown to the reviewer, but do not block a post. */\nconst ADVISORY = [\n  { id: 'EFFICACY_WORD', pattern: /\\b(effective|safe|successful)\\b/i, why: 'efficacy wording — verify it is attributed to the source' },\n  { id: 'SUCCESS_RATE', pattern: /\\bsuccess\\s+rates?\\b/i, why: 'mentions success rates — any figure must be grounded' },\n];\n\nconst CTA_CUES = /\\b(learn|explore|discover|read|compare|find out|see|request|browse|check|talk to|speak with|get in touch|contact)\\b/i;\n\n/** \"16,000\" and \"16000.0\" and \"$16,000\" must all compare equal. */\nfunction normaliseNumber(token) {\n  const cleaned = String(token).replace(/[^0-9.]/g, '');\n  if (!cleaned) return null;\n  const value = Number(cleaned);\n  return Number.isFinite(value) ? value : null;\n}\n\n/**\n * Every digit-bearing token in the text.\n *\n * Trailing punctuation is stripped: \"under 40.\" must yield \"40\", not \"40.\",\n * so that the evidence we report back to the generator and the reviewer reads\n * as the figure itself. Internal separators are kept — \"16,000\" and \"3.4\" are\n * single figures, not several.\n */\nfunction numericTokens(text) {\n  const matches = text.match(/\\d[\\d.,]*\\s*%?/g) || [];\n  return matches\n    .map((t) => t.trim().replace(/[.,]+$/, ''))\n    .filter(Boolean);\n}\n\nfunction buildSourceNumberSet(sourceText) {\n  const set = new Set();\n  for (const token of numericTokens(sourceText)) {\n    const value = normaliseNumber(token);\n    if (value !== null) set.add(value);\n  }\n  return set;\n}\n\n/**\n * @param {object} post      Generator output: { post_text, hashtags }\n * @param {object} content   extractContent() output for the source page\n * @param {object} config    { maxLengthBeforeLink, minHashtags, maxHashtags, allowPriceMention }\n */\nfunction runRuleChecks(post, content, config = {}) {\n  const maxLength = config.maxLengthBeforeLink == null ? 500 : config.maxLengthBeforeLink;\n  const minHashtags = config.minHashtags == null ? 3 : config.minHashtags;\n  const maxHashtags = config.maxHashtags == null ? 5 : config.maxHashtags;\n  const allowPrice = config.allowPriceMention === true;\n\n  const violations = [];\n  const advisories = [];\n  const text = String(post.post_text || '').trim();\n\n  const fail = (rule, detail, evidence) =>\n    violations.push({ rule, severity: 'fail', detail, evidence: evidence || null });\n  const warn = (rule, detail, evidence) =>\n    advisories.push({ rule, severity: 'warn', detail, evidence: evidence || null });\n\n  if (!text) {\n    fail('EMPTY_POST', 'generator returned no post text');\n    return { passed: false, violations, advisories, metrics: {} };\n  }\n\n  // ---- Link integrity -----------------------------------------------------\n  const sourceUrl = content.url || '';\n  const linkIndex = sourceUrl ? text.indexOf(sourceUrl) : -1;\n  if (!sourceUrl) {\n    fail('NO_SOURCE_URL', 'source item has no URL to link to');\n  } else if (linkIndex === -1) {\n    fail('LINK_MISSING', 'post does not contain the exact source URL', sourceUrl);\n  }\n\n  const otherLinks = (text.match(/https?:\\/\\/\\S+/g) || []).filter((u) => !u.startsWith(sourceUrl));\n  if (otherLinks.length > 0) {\n    fail('FOREIGN_LINK', 'post links somewhere other than the source page', otherLinks.join(', '));\n  }\n\n  // ---- Length before the link --------------------------------------------\n  const beforeLink = (linkIndex === -1 ? text : text.slice(0, linkIndex)).trim();\n  const lengthBeforeLink = beforeLink.length;\n  if (lengthBeforeLink > maxLength) {\n    fail('LENGTH_EXCEEDED', `${lengthBeforeLink} chars before the link, limit is ${maxLength}`);\n  }\n  if (lengthBeforeLink < 80) {\n    fail('LENGTH_TOO_SHORT', `${lengthBeforeLink} chars before the link — too thin to be useful`);\n  }\n\n  // ---- Hashtags -----------------------------------------------------------\n  const hashtags = text.match(/#[\\p{L}\\p{N}_]+/gu) || [];\n  if (hashtags.length < minHashtags || hashtags.length > maxHashtags) {\n    fail('HASHTAG_COUNT', `${hashtags.length} hashtags, expected ${minHashtags}-${maxHashtags}`, hashtags.join(' '));\n  }\n  const duplicateTags = hashtags.filter((t, i) => hashtags.findIndex((o) => o.toLowerCase() === t.toLowerCase()) !== i);\n  if (duplicateTags.length) {\n    fail('HASHTAG_DUPLICATE', 'duplicate hashtags', duplicateTags.join(' '));\n  }\n\n  // ---- Prohibited claims --------------------------------------------------\n  // Checked against the prose only: a hashtag like #CancerCare must not trip\n  // the disease patterns, and the URL slug is not editorial copy.\n  const prose = text\n    .replace(/https?:\\/\\/\\S+/g, ' ')\n    .replace(/#[\\p{L}\\p{N}_]+/gu, ' ');\n\n  for (const rule of PROHIBITED) {\n    const hit = rule.pattern.exec(prose);\n    if (hit) fail(`CLAIM_${rule.id}`, rule.why, hit[0]);\n  }\n  for (const rule of ADVISORY) {\n    const hit = rule.pattern.exec(prose);\n    if (hit) warn(`ADVISORY_${rule.id}`, rule.why, hit[0]);\n  }\n\n  // ---- Price policy -------------------------------------------------------\n  const currencyHits = prose.match(/(?:US\\$|\\$|€|£|USD|EUR|GBP)\\s?\\d[\\d.,]*|\\d[\\d.,]*\\s?(?:USD|EUR|GBP)\\b/gi) || [];\n  if (currencyHits.length > 0) {\n    if (!allowPrice) {\n      fail('PRICE_MENTION', 'post states a price but ALLOW_PRICE_MENTION is off', currencyHits.join(', '));\n    } else if (content.price == null) {\n      fail('PRICE_UNGROUNDED', 'post states a price but the source page publishes none', currencyHits.join(', '));\n    } else {\n      const sourcePrice = Number(content.price);\n      const mismatched = currencyHits.filter((hit) => normaliseNumber(hit) !== sourcePrice);\n      if (mismatched.length) {\n        fail('PRICE_MISMATCH', `price does not match the source (${sourcePrice} ${content.priceCurrency || ''})`, mismatched.join(', '));\n      }\n    }\n  }\n\n  // ---- Numeric grounding --------------------------------------------------\n  // The single highest-value check here. Hallucinated statistics are the most\n  // likely and most damaging failure mode for this kind of post, and they are\n  // trivially detectable: every figure in the copy must appear in the source.\n  const sourceNumbers = buildSourceNumberSet(content.sourceText || '');\n  if (allowPrice && content.price != null) sourceNumbers.add(Number(content.price));\n\n  const ungrounded = [];\n  for (const token of numericTokens(prose)) {\n    const value = normaliseNumber(token);\n    if (value === null) continue;\n    // Small integers are ordinary prose (\"3 clinics\", \"2 weeks\") and appear in\n    // almost any source; demanding an exact match on them creates false alarms.\n    if (Number.isInteger(value) && value <= 10) continue;\n    if (!sourceNumbers.has(value)) ungrounded.push(token.trim());\n  }\n  if (ungrounded.length) {\n    fail('UNGROUNDED_NUMBER', 'figure does not appear anywhere in the source page', ungrounded.join(', '));\n  }\n\n  // ---- Shape and tone -----------------------------------------------------\n  if (!CTA_CUES.test(prose)) {\n    warn('NO_CTA_CUE', 'no recognisable call to action');\n  }\n\n  const shouted = prose.match(/\\b[A-Z]{4,}\\b/g) || [];\n  const allowedCaps = new Set(['IVF', 'FDA', 'KFSHRC', 'USA', 'MRI', 'ICU', 'PLACIDWAY']);\n  const realShouting = shouted.filter((w) => !allowedCaps.has(w.toUpperCase()));\n  if (realShouting.length) warn('SHOUTING', 'all-caps words', realShouting.join(', '));\n\n  const emoji = text.match(/\\p{Extended_Pictographic}/gu) || [];\n  if (emoji.length > 6) warn('EMOJI_OVERLOAD', `${emoji.length} emoji`);\n\n  const valueLines = beforeLink\n    .split('\\n')\n    .map((l) => l.trim())\n    .filter((l) => l && !/^#/.test(l));\n  if (valueLines.length < 3 || valueLines.length > 7) {\n    warn('SHAPE', `${valueLines.length} non-hashtag lines before the link (hook + 2-4 value lines + CTA expected)`);\n  }\n\n  return {\n    passed: violations.length === 0,\n    violations,\n    advisories,\n    metrics: {\n      lengthBeforeLink,\n      totalLength: text.length,\n      hashtagCount: hashtags.length,\n      hashtags,\n      emojiCount: emoji.length,\n      valueLineCount: valueLines.length,\n      numbersInPost: numericTokens(prose),\n      sourceNumbersKnown: sourceNumbers.size,\n    },\n  };\n}\n\n/**\n * Parse the layer-2 reviewer's JSON verdict defensively. An unreadable verdict\n * is treated as a failure, never as a pass — the guardrail fails closed.\n */\nfunction parseVerdict(raw) {\n  const text = typeof raw === 'string' ? raw : JSON.stringify(raw);\n  let parsed = null;\n\n  try {\n    parsed = JSON.parse(text);\n  } catch {\n    const fenced = /```(?:json)?\\s*([\\s\\S]*?)```/.exec(text);\n    const braced = /\\{[\\s\\S]*\\}/.exec(text);\n    const candidate = (fenced && fenced[1]) || (braced && braced[0]);\n    if (candidate) {\n      try {\n        parsed = JSON.parse(candidate);\n      } catch {\n        parsed = null;\n      }\n    }\n  }\n\n  if (!parsed || typeof parsed !== 'object') {\n    return { verdict: 'FAIL', reviewerViolations: [{ rule: 'VERDICT_UNPARSEABLE', detail: 'reviewer did not return valid JSON' }], raw: text };\n  }\n\n  const verdict = String(parsed.verdict || '').toUpperCase() === 'PASS' ? 'PASS' : 'FAIL';\n  return {\n    verdict,\n    reviewerViolations: Array.isArray(parsed.violations) ? parsed.violations : [],\n    reviewerNotes: parsed.notes || null,\n    raw: text,\n  };\n}\n\n// ---- node driver ----------------------------------------------------------\nconst d = $json;\nconst rules = runRuleChecks(d.post, d.content, {\n  maxLengthBeforeLink: d.run.maxChars,\n  minHashtags: d.run.minHashtags,\n  maxHashtags: d.run.maxHashtags,\n  allowPriceMention: d.run.allowPriceMention,\n});\n\nif (d.generationError) {\n  rules.passed = false;\n  rules.violations = [{ rule: 'GENERATION_FAILED', severity: 'fail', detail: d.generationError }].concat(rules.violations);\n}\n\nreturn [{ json: { ...d, rules } }];"
+      },
+      "id": "pw-017",
+      "name": "Rule Checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2460,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "pw-018",
+              "leftValue": "={{ $json.rules.passed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "pw-019",
+      "name": "Rules Passed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2680,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Prompt assembly and provider plumbing.\n *\n * Shared by three callers that must never disagree:\n *   - the n8n \"Build Generator Request\" / \"Build Validator Request\" Code nodes\n *     (this file is inlined into them at build time)\n *   - scripts/dry-run.mjs, the local harness\n *   - scripts/make-samples.mjs, which produces the sample output deliverable\n *\n * Self-contained: no imports. Prompt text is passed in, not read from disk,\n * because an n8n Code node has no filesystem.\n */\n\n/** Substitute every {{PLACEHOLDER}} present in `vars`. Unknown ones are left alone. */\nfunction fillTemplate(template, vars) {\n  let out = String(template);\n  for (const [key, value] of Object.entries(vars)) {\n    out = out.split(`{{${key}}}`).join(value == null ? '' : String(value));\n  }\n  return out;\n}\n\n/**\n * The price instruction is the single most load-bearing line in the generator\n * prompt, so it is built explicitly rather than interpolated inline.\n *\n * Three distinct states, and they must not be collapsed:\n *   - the page lists a price and we are allowed to cite it (exactly, unchanged)\n *   - the page lists a price and we are not allowed to cite it\n *   - the page lists no price at all\n */\nfunction priceInstruction(content, allowPriceMention) {\n  if (content.price == null) {\n    return 'Listed price: none published on this page — you MUST NOT mention any price or cost figure.';\n  }\n  const figure = `${content.price} ${content.priceCurrency || ''}`.trim();\n  return allowPriceMention\n    ? `Listed price: ${figure} — you MAY cite this exact figure, unchanged and in full. No other number, and no \"from\"/\"starting at\" framing.`\n    : `Listed price: ${figure} — this is for your context only. You MUST NOT mention any price or cost figure in the post.`;\n}\n\nfunction retryFeedbackBlock(feedback) {\n  if (!feedback) return '';\n  return [\n    'YOUR PREVIOUS ATTEMPT WAS REJECTED BY THE GUARDRAILS.',\n    feedback,\n    'Rewrite the post from scratch and fix every point above. Do not argue with the rejection.',\n  ].join('\\n');\n}\n\n/** Build the generator's system + user messages. */\nfunction composeGenerator({ content, run, feedback, prompts }) {\n  const system = fillTemplate(prompts.system, { MAX_CHARS: run.maxChars });\n  const user = fillTemplate(prompts.user, {\n    CONTENT_TYPE: content.contentType,\n    TITLE: content.title,\n    URL: content.url,\n    PROVIDER: content.provider || 'PlacidWay marketplace listing',\n    PRICE_LINE: priceInstruction(content, run.allowPriceMention),\n    SUMMARY: content.summary || '(none)',\n    BODY: content.bodyForModel || content.body || '',\n    RETRY_FEEDBACK: retryFeedbackBlock(feedback),\n  });\n  return { system, user };\n}\n\n/**\n * Build the reviewer's system + user messages.\n *\n * Note what is absent: the generator's `grounding_notes` and `hook`/`cta`\n * breakdown. The reviewer is given the source and the finished post, nothing\n * else. Showing it the author's own justification turns an independent check\n * into a rubber stamp.\n */\nfunction composeValidator({ content, post, prompts }) {\n  const user = fillTemplate(prompts.user, {\n    TITLE: content.title,\n    URL: content.url,\n    PRICE_LINE:\n      content.price == null\n        ? 'The source page publishes no price.'\n        : `Listed price on the source page: ${content.price} ${content.priceCurrency || ''}`.trim(),\n    SUMMARY: content.summary || '(none)',\n    BODY: content.bodyForModel || content.body || '',\n    POST_TEXT: post.post_text || '',\n  });\n  return { system: prompts.system, user };\n}\n\n/** Shape the request body for whichever provider is configured. */\nfunction toProviderBody(provider, { system, user, model, temperature, maxTokens, jsonMode }) {\n  if (provider === 'anthropic') {\n    return {\n      model,\n      max_tokens: maxTokens,\n      temperature,\n      system,\n      messages: [{ role: 'user', content: user }],\n    };\n  }\n  const body = {\n    model,\n    temperature,\n    max_tokens: maxTokens,\n    messages: [\n      { role: 'system', content: system },\n      { role: 'user', content: user },\n    ],\n  };\n  if (jsonMode) body.response_format = { type: 'json_object' };\n  return body;\n}\n\n/** Pull the assistant text out of a provider response. */\nfunction readCompletionText(provider, response) {\n  if (!response) return '';\n  if (provider === 'anthropic') {\n    const block = (response.content || [])[0] || {};\n    return block.text || '';\n  }\n  const choice = (response.choices || [])[0] || {};\n  return (choice.message || {}).content || '';\n}\n\n/**\n * Parse JSON out of a model response that may be fenced or wrapped in prose.\n * Returns null rather than throwing — callers treat null as a failed attempt.\n */\nfunction readJsonLoose(text) {\n  const raw = String(text || '').trim();\n  if (!raw) return null;\n  try {\n    return JSON.parse(raw);\n  } catch {\n    /* fall through */\n  }\n  const fenced = /```(?:json)?\\s*([\\s\\S]*?)```/.exec(raw);\n  const braced = /\\{[\\s\\S]*\\}/.exec(raw);\n  const candidate = (fenced && fenced[1]) || (braced && braced[0]);\n  if (!candidate) return null;\n  try {\n    return JSON.parse(candidate);\n  } catch {\n    return null;\n  }\n}\n\n/**\n * The model sometimes puts the link or hashtags only in the structured fields\n * and omits them from post_text. Repair rather than reject: the guardrails\n * still get the final say on whatever comes out of here.\n */\nfunction normalisePost(post, content) {\n  let text = String(post.post_text || '').trim();\n  if (!text) return { ...post, post_text: '' };\n\n  if (content.url && !text.includes(content.url)) {\n    text += `\\n${content.url}`;\n  }\n  const tags = Array.isArray(post.hashtags) ? post.hashtags : [];\n  if (tags.length && !/#[\\p{L}\\p{N}_]+/u.test(text)) {\n    text += `\\n${tags.join(' ')}`;\n  }\n  return { ...post, post_text: text };\n}\n\n// ---- node driver ----------------------------------------------------------\n// Temperature 0: this is a check, and a check that returns a different answer\n// each time it runs is not a check.\nconst d = $json;\nconst prompts = { system: \"You are a compliance reviewer for a medical tourism marketplace. A draft social\\nmedia post has been written from a source page. Your job is to find reasons it\\nmust not be published. You are not the author's editor and you are not here to\\nimprove the copy — you either clear it or you block it.\\n\\nCheck the post against each rule and cite the exact offending text.\\n\\n**R1 — Grounding.** Every factual assertion in the post must be supported by the\\nSOURCE. Treat as a violation anything stated as fact that you cannot locate in\\nthe source text, including implied facts. Generic, non-factual framing\\n(\\\"choosing care abroad raises hard questions\\\") is acceptable.\\n\\n**R2 — Medical claims.** The post must not state or imply a cure, a recovery, a\\nclinical outcome, a guarantee, an absence of risk, or an absence of pain or side\\neffects.\\n\\n**R3 — Numbers.** Every figure — price, percentage, success rate, duration,\\ncount, year — must appear verbatim in the SOURCE. A figure that is merely\\nplausible is a violation.\\n\\n**R4 — Superlatives and ranking.** No \\\"best\\\", \\\"safest\\\", \\\"top\\\", \\\"#1\\\", \\\"leading\\\",\\nor any claim that one provider is better than another.\\n\\n**R5 — Advice.** The post must not tell the reader what treatment to undergo.\\n\\n**R6 — Attribution.** No invented quotes, testimonials, accreditations or awards.\\n\\n**R7 — Link.** The post must link to the canonical URL given, and to nothing else.\\n\\n## How to decide\\n\\n- Any R1–R7 violation ⇒ `\\\"verdict\\\": \\\"FAIL\\\"`.\\n- If you are unsure whether something is supported by the source ⇒ **FAIL**.\\n  Being wrong about a medical claim is far more costly than regenerating a post.\\n- Only return `\\\"PASS\\\"` when every assertion is traceable and no rule is touched.\\n\\nDo not rewrite the post. Do not suggest fixes. Report only.\\n\\n## Output format\\n\\nReturn only this JSON object, no prose and no code fences:\\n\\n```\\n{\\n  \\\"verdict\\\": \\\"PASS\\\" | \\\"FAIL\\\",\\n  \\\"violations\\\": [\\n    { \\\"rule\\\": \\\"R3\\\", \\\"quote\\\": \\\"exact text from the post\\\", \\\"why\\\": \\\"one sentence\\\" }\\n  ],\\n  \\\"notes\\\": \\\"one sentence summary, or null\\\"\\n}\\n```\\n\\nAn empty `violations` array is required for a PASS.\", user: \"SOURCE\\n\\nTitle: {{TITLE}}\\nCanonical URL: {{URL}}\\n{{PRICE_LINE}}\\n\\nSummary:\\n{{SUMMARY}}\\n\\nBody:\\n{{BODY}}\\n\\n---\\n\\nPOST UNDER REVIEW\\n\\n{{POST_TEXT}}\\n\\n---\\n\\nReview the post against R1–R7. Return only the JSON object.\" };\n\nconst { system, user } = composeValidator({\n  content: d.content,\n  post: d.post,\n  prompts,\n});\n\nconst body = toProviderBody(\"openai\", {\n  system,\n  user,\n  model: d.run.model,\n  temperature: 0,\n  maxTokens: 800,\n  jsonMode: true,\n});\n\nreturn [{ json: { ...d, body } }];"
+      },
+      "id": "pw-020",
+      "name": "Build Validator Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2900,
+        -220
+      ],
+      "notes": "The reviewer sees only the source and the finished post — never the generator’s own grounding_notes."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "pw-021",
+      "name": "Validate Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3120,
+        -220
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PW_OPENAI",
+          "name": "OpenAI API key (Authorization: Bearer)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Layer 1 of the guardrail: deterministic, rule-based checks.\n *\n * This layer exists to catch everything that does NOT need judgement — length,\n * hashtag count, link integrity, forbidden claim phrases, and above all whether\n * every number in the post can be found in the source page. It is cheap,\n * reproducible, and it fails closed.\n *\n * Layer 2 (an independent LLM reviewer, see prompts/validator.md) catches what\n * regex cannot: implied promises, tonal over-reach, and facts that are phrased\n * plausibly but are simply not on the page.\n *\n * Self-contained by design — injected verbatim into an n8n Code node.\n */\n\n/**\n * Hard failures. These are promises and claims a medical-tourism marketplace\n * must never publish, regardless of what the source page says.\n *\n * Note what is deliberately NOT here: topic words like \"cost\", \"success rate\",\n * \"treatment\" or \"recovery\". PlacidWay's own article titles contain them\n * (\"IVF in Mexico vs USA: Cost & Success Rates\"), so banning them would reject\n * accurate posts. We ban the *claim*, not the *subject*.\n */\nconst PROHIBITED = [\n  { id: 'CURE', pattern: /\\b(cure[sd]?|curing)\\b/i, why: 'claims a cure' },\n  { id: 'GUARANTEE', pattern: /\\b(guarantee[sd]?|guaranteeing)\\b/i, why: 'promises an outcome' },\n  { id: 'ABSOLUTE_PCT', pattern: /\\b100\\s*%\\s*(safe|effective|success|painless|guaranteed)\\b/i, why: 'absolute safety/efficacy claim' },\n  { id: 'RISK_FREE', pattern: /\\brisk[\\s-]?free\\b/i, why: 'denies clinical risk' },\n  { id: 'PAINLESS', pattern: /\\b(painless|pain[\\s-]?free)\\b/i, why: 'promises a pain-free experience' },\n  { id: 'NO_SIDE_EFFECTS', pattern: /\\b(no side[\\s-]?effects?|side[\\s-]?effect[\\s-]?free)\\b/i, why: 'denies side effects' },\n  { id: 'MIRACLE', pattern: /\\bmiracle|miraculous\\b/i, why: 'sensationalises treatment' },\n  { id: 'PERMANENT_FIX', pattern: /\\bpermanent(ly)?\\s+(cure|fix|solution|relief)\\b/i, why: 'promises permanence' },\n  { id: 'PROVEN_TO', pattern: /\\bproven\\s+to\\s+(cure|heal|eliminate|reverse|restore)\\b/i, why: 'unsupported efficacy claim' },\n  { id: 'WILL_OUTCOME', pattern: /\\b(will|guarantees?\\s+to)\\s+(cure|heal|fix|eliminate|reverse|restore)\\b/i, why: 'promises a clinical outcome' },\n  { id: 'SUPERLATIVE', pattern: /\\b(the\\s+(best|safest|top)\\s+\\w+|#\\s?1\\b|\\bnumber\\s+one\\b|world'?s\\s+(best|leading|top))/i, why: 'unverifiable superlative' },\n  { id: 'INSTANT', pattern: /\\binstant(ly)?\\s+(relief|results?|recovery)\\b/i, why: 'promises instant results' },\n  { id: 'ELIMINATES', pattern: /\\b(eliminates?|reverses?|removes?)\\s+(all\\s+)?(pain|cancer|disease|illness)\\b/i, why: 'promises disease elimination' },\n  { id: 'MEDICAL_ADVICE', pattern: /\\byou\\s+(should|must|need to)\\s+(get|have|undergo|take)\\b/i, why: 'gives individual medical advice' },\n];\n\n/** Soft signals. Logged and shown to the reviewer, but do not block a post. */\nconst ADVISORY = [\n  { id: 'EFFICACY_WORD', pattern: /\\b(effective|safe|successful)\\b/i, why: 'efficacy wording — verify it is attributed to the source' },\n  { id: 'SUCCESS_RATE', pattern: /\\bsuccess\\s+rates?\\b/i, why: 'mentions success rates — any figure must be grounded' },\n];\n\nconst CTA_CUES = /\\b(learn|explore|discover|read|compare|find out|see|request|browse|check|talk to|speak with|get in touch|contact)\\b/i;\n\n/** \"16,000\" and \"16000.0\" and \"$16,000\" must all compare equal. */\nfunction normaliseNumber(token) {\n  const cleaned = String(token).replace(/[^0-9.]/g, '');\n  if (!cleaned) return null;\n  const value = Number(cleaned);\n  return Number.isFinite(value) ? value : null;\n}\n\n/**\n * Every digit-bearing token in the text.\n *\n * Trailing punctuation is stripped: \"under 40.\" must yield \"40\", not \"40.\",\n * so that the evidence we report back to the generator and the reviewer reads\n * as the figure itself. Internal separators are kept — \"16,000\" and \"3.4\" are\n * single figures, not several.\n */\nfunction numericTokens(text) {\n  const matches = text.match(/\\d[\\d.,]*\\s*%?/g) || [];\n  return matches\n    .map((t) => t.trim().replace(/[.,]+$/, ''))\n    .filter(Boolean);\n}\n\nfunction buildSourceNumberSet(sourceText) {\n  const set = new Set();\n  for (const token of numericTokens(sourceText)) {\n    const value = normaliseNumber(token);\n    if (value !== null) set.add(value);\n  }\n  return set;\n}\n\n/**\n * @param {object} post      Generator output: { post_text, hashtags }\n * @param {object} content   extractContent() output for the source page\n * @param {object} config    { maxLengthBeforeLink, minHashtags, maxHashtags, allowPriceMention }\n */\nfunction runRuleChecks(post, content, config = {}) {\n  const maxLength = config.maxLengthBeforeLink == null ? 500 : config.maxLengthBeforeLink;\n  const minHashtags = config.minHashtags == null ? 3 : config.minHashtags;\n  const maxHashtags = config.maxHashtags == null ? 5 : config.maxHashtags;\n  const allowPrice = config.allowPriceMention === true;\n\n  const violations = [];\n  const advisories = [];\n  const text = String(post.post_text || '').trim();\n\n  const fail = (rule, detail, evidence) =>\n    violations.push({ rule, severity: 'fail', detail, evidence: evidence || null });\n  const warn = (rule, detail, evidence) =>\n    advisories.push({ rule, severity: 'warn', detail, evidence: evidence || null });\n\n  if (!text) {\n    fail('EMPTY_POST', 'generator returned no post text');\n    return { passed: false, violations, advisories, metrics: {} };\n  }\n\n  // ---- Link integrity -----------------------------------------------------\n  const sourceUrl = content.url || '';\n  const linkIndex = sourceUrl ? text.indexOf(sourceUrl) : -1;\n  if (!sourceUrl) {\n    fail('NO_SOURCE_URL', 'source item has no URL to link to');\n  } else if (linkIndex === -1) {\n    fail('LINK_MISSING', 'post does not contain the exact source URL', sourceUrl);\n  }\n\n  const otherLinks = (text.match(/https?:\\/\\/\\S+/g) || []).filter((u) => !u.startsWith(sourceUrl));\n  if (otherLinks.length > 0) {\n    fail('FOREIGN_LINK', 'post links somewhere other than the source page', otherLinks.join(', '));\n  }\n\n  // ---- Length before the link --------------------------------------------\n  const beforeLink = (linkIndex === -1 ? text : text.slice(0, linkIndex)).trim();\n  const lengthBeforeLink = beforeLink.length;\n  if (lengthBeforeLink > maxLength) {\n    fail('LENGTH_EXCEEDED', `${lengthBeforeLink} chars before the link, limit is ${maxLength}`);\n  }\n  if (lengthBeforeLink < 80) {\n    fail('LENGTH_TOO_SHORT', `${lengthBeforeLink} chars before the link — too thin to be useful`);\n  }\n\n  // ---- Hashtags -----------------------------------------------------------\n  const hashtags = text.match(/#[\\p{L}\\p{N}_]+/gu) || [];\n  if (hashtags.length < minHashtags || hashtags.length > maxHashtags) {\n    fail('HASHTAG_COUNT', `${hashtags.length} hashtags, expected ${minHashtags}-${maxHashtags}`, hashtags.join(' '));\n  }\n  const duplicateTags = hashtags.filter((t, i) => hashtags.findIndex((o) => o.toLowerCase() === t.toLowerCase()) !== i);\n  if (duplicateTags.length) {\n    fail('HASHTAG_DUPLICATE', 'duplicate hashtags', duplicateTags.join(' '));\n  }\n\n  // ---- Prohibited claims --------------------------------------------------\n  // Checked against the prose only: a hashtag like #CancerCare must not trip\n  // the disease patterns, and the URL slug is not editorial copy.\n  const prose = text\n    .replace(/https?:\\/\\/\\S+/g, ' ')\n    .replace(/#[\\p{L}\\p{N}_]+/gu, ' ');\n\n  for (const rule of PROHIBITED) {\n    const hit = rule.pattern.exec(prose);\n    if (hit) fail(`CLAIM_${rule.id}`, rule.why, hit[0]);\n  }\n  for (const rule of ADVISORY) {\n    const hit = rule.pattern.exec(prose);\n    if (hit) warn(`ADVISORY_${rule.id}`, rule.why, hit[0]);\n  }\n\n  // ---- Price policy -------------------------------------------------------\n  const currencyHits = prose.match(/(?:US\\$|\\$|€|£|USD|EUR|GBP)\\s?\\d[\\d.,]*|\\d[\\d.,]*\\s?(?:USD|EUR|GBP)\\b/gi) || [];\n  if (currencyHits.length > 0) {\n    if (!allowPrice) {\n      fail('PRICE_MENTION', 'post states a price but ALLOW_PRICE_MENTION is off', currencyHits.join(', '));\n    } else if (content.price == null) {\n      fail('PRICE_UNGROUNDED', 'post states a price but the source page publishes none', currencyHits.join(', '));\n    } else {\n      const sourcePrice = Number(content.price);\n      const mismatched = currencyHits.filter((hit) => normaliseNumber(hit) !== sourcePrice);\n      if (mismatched.length) {\n        fail('PRICE_MISMATCH', `price does not match the source (${sourcePrice} ${content.priceCurrency || ''})`, mismatched.join(', '));\n      }\n    }\n  }\n\n  // ---- Numeric grounding --------------------------------------------------\n  // The single highest-value check here. Hallucinated statistics are the most\n  // likely and most damaging failure mode for this kind of post, and they are\n  // trivially detectable: every figure in the copy must appear in the source.\n  const sourceNumbers = buildSourceNumberSet(content.sourceText || '');\n  if (allowPrice && content.price != null) sourceNumbers.add(Number(content.price));\n\n  const ungrounded = [];\n  for (const token of numericTokens(prose)) {\n    const value = normaliseNumber(token);\n    if (value === null) continue;\n    // Small integers are ordinary prose (\"3 clinics\", \"2 weeks\") and appear in\n    // almost any source; demanding an exact match on them creates false alarms.\n    if (Number.isInteger(value) && value <= 10) continue;\n    if (!sourceNumbers.has(value)) ungrounded.push(token.trim());\n  }\n  if (ungrounded.length) {\n    fail('UNGROUNDED_NUMBER', 'figure does not appear anywhere in the source page', ungrounded.join(', '));\n  }\n\n  // ---- Shape and tone -----------------------------------------------------\n  if (!CTA_CUES.test(prose)) {\n    warn('NO_CTA_CUE', 'no recognisable call to action');\n  }\n\n  const shouted = prose.match(/\\b[A-Z]{4,}\\b/g) || [];\n  const allowedCaps = new Set(['IVF', 'FDA', 'KFSHRC', 'USA', 'MRI', 'ICU', 'PLACIDWAY']);\n  const realShouting = shouted.filter((w) => !allowedCaps.has(w.toUpperCase()));\n  if (realShouting.length) warn('SHOUTING', 'all-caps words', realShouting.join(', '));\n\n  const emoji = text.match(/\\p{Extended_Pictographic}/gu) || [];\n  if (emoji.length > 6) warn('EMOJI_OVERLOAD', `${emoji.length} emoji`);\n\n  const valueLines = beforeLink\n    .split('\\n')\n    .map((l) => l.trim())\n    .filter((l) => l && !/^#/.test(l));\n  if (valueLines.length < 3 || valueLines.length > 7) {\n    warn('SHAPE', `${valueLines.length} non-hashtag lines before the link (hook + 2-4 value lines + CTA expected)`);\n  }\n\n  return {\n    passed: violations.length === 0,\n    violations,\n    advisories,\n    metrics: {\n      lengthBeforeLink,\n      totalLength: text.length,\n      hashtagCount: hashtags.length,\n      hashtags,\n      emojiCount: emoji.length,\n      valueLineCount: valueLines.length,\n      numbersInPost: numericTokens(prose),\n      sourceNumbersKnown: sourceNumbers.size,\n    },\n  };\n}\n\n/**\n * Parse the layer-2 reviewer's JSON verdict defensively. An unreadable verdict\n * is treated as a failure, never as a pass — the guardrail fails closed.\n */\nfunction parseVerdict(raw) {\n  const text = typeof raw === 'string' ? raw : JSON.stringify(raw);\n  let parsed = null;\n\n  try {\n    parsed = JSON.parse(text);\n  } catch {\n    const fenced = /```(?:json)?\\s*([\\s\\S]*?)```/.exec(text);\n    const braced = /\\{[\\s\\S]*\\}/.exec(text);\n    const candidate = (fenced && fenced[1]) || (braced && braced[0]);\n    if (candidate) {\n      try {\n        parsed = JSON.parse(candidate);\n      } catch {\n        parsed = null;\n      }\n    }\n  }\n\n  if (!parsed || typeof parsed !== 'object') {\n    return { verdict: 'FAIL', reviewerViolations: [{ rule: 'VERDICT_UNPARSEABLE', detail: 'reviewer did not return valid JSON' }], raw: text };\n  }\n\n  const verdict = String(parsed.verdict || '').toUpperCase() === 'PASS' ? 'PASS' : 'FAIL';\n  return {\n    verdict,\n    reviewerViolations: Array.isArray(parsed.violations) ? parsed.violations : [],\n    reviewerNotes: parsed.notes || null,\n    raw: text,\n  };\n}\n\n/**\n * Prompt assembly and provider plumbing.\n *\n * Shared by three callers that must never disagree:\n *   - the n8n \"Build Generator Request\" / \"Build Validator Request\" Code nodes\n *     (this file is inlined into them at build time)\n *   - scripts/dry-run.mjs, the local harness\n *   - scripts/make-samples.mjs, which produces the sample output deliverable\n *\n * Self-contained: no imports. Prompt text is passed in, not read from disk,\n * because an n8n Code node has no filesystem.\n */\n\n/** Substitute every {{PLACEHOLDER}} present in `vars`. Unknown ones are left alone. */\nfunction fillTemplate(template, vars) {\n  let out = String(template);\n  for (const [key, value] of Object.entries(vars)) {\n    out = out.split(`{{${key}}}`).join(value == null ? '' : String(value));\n  }\n  return out;\n}\n\n/**\n * The price instruction is the single most load-bearing line in the generator\n * prompt, so it is built explicitly rather than interpolated inline.\n *\n * Three distinct states, and they must not be collapsed:\n *   - the page lists a price and we are allowed to cite it (exactly, unchanged)\n *   - the page lists a price and we are not allowed to cite it\n *   - the page lists no price at all\n */\nfunction priceInstruction(content, allowPriceMention) {\n  if (content.price == null) {\n    return 'Listed price: none published on this page — you MUST NOT mention any price or cost figure.';\n  }\n  const figure = `${content.price} ${content.priceCurrency || ''}`.trim();\n  return allowPriceMention\n    ? `Listed price: ${figure} — you MAY cite this exact figure, unchanged and in full. No other number, and no \"from\"/\"starting at\" framing.`\n    : `Listed price: ${figure} — this is for your context only. You MUST NOT mention any price or cost figure in the post.`;\n}\n\nfunction retryFeedbackBlock(feedback) {\n  if (!feedback) return '';\n  return [\n    'YOUR PREVIOUS ATTEMPT WAS REJECTED BY THE GUARDRAILS.',\n    feedback,\n    'Rewrite the post from scratch and fix every point above. Do not argue with the rejection.',\n  ].join('\\n');\n}\n\n/** Build the generator's system + user messages. */\nfunction composeGenerator({ content, run, feedback, prompts }) {\n  const system = fillTemplate(prompts.system, { MAX_CHARS: run.maxChars });\n  const user = fillTemplate(prompts.user, {\n    CONTENT_TYPE: content.contentType,\n    TITLE: content.title,\n    URL: content.url,\n    PROVIDER: content.provider || 'PlacidWay marketplace listing',\n    PRICE_LINE: priceInstruction(content, run.allowPriceMention),\n    SUMMARY: content.summary || '(none)',\n    BODY: content.bodyForModel || content.body || '',\n    RETRY_FEEDBACK: retryFeedbackBlock(feedback),\n  });\n  return { system, user };\n}\n\n/**\n * Build the reviewer's system + user messages.\n *\n * Note what is absent: the generator's `grounding_notes` and `hook`/`cta`\n * breakdown. The reviewer is given the source and the finished post, nothing\n * else. Showing it the author's own justification turns an independent check\n * into a rubber stamp.\n */\nfunction composeValidator({ content, post, prompts }) {\n  const user = fillTemplate(prompts.user, {\n    TITLE: content.title,\n    URL: content.url,\n    PRICE_LINE:\n      content.price == null\n        ? 'The source page publishes no price.'\n        : `Listed price on the source page: ${content.price} ${content.priceCurrency || ''}`.trim(),\n    SUMMARY: content.summary || '(none)',\n    BODY: content.bodyForModel || content.body || '',\n    POST_TEXT: post.post_text || '',\n  });\n  return { system: prompts.system, user };\n}\n\n/** Shape the request body for whichever provider is configured. */\nfunction toProviderBody(provider, { system, user, model, temperature, maxTokens, jsonMode }) {\n  if (provider === 'anthropic') {\n    return {\n      model,\n      max_tokens: maxTokens,\n      temperature,\n      system,\n      messages: [{ role: 'user', content: user }],\n    };\n  }\n  const body = {\n    model,\n    temperature,\n    max_tokens: maxTokens,\n    messages: [\n      { role: 'system', content: system },\n      { role: 'user', content: user },\n    ],\n  };\n  if (jsonMode) body.response_format = { type: 'json_object' };\n  return body;\n}\n\n/** Pull the assistant text out of a provider response. */\nfunction readCompletionText(provider, response) {\n  if (!response) return '';\n  if (provider === 'anthropic') {\n    const block = (response.content || [])[0] || {};\n    return block.text || '';\n  }\n  const choice = (response.choices || [])[0] || {};\n  return (choice.message || {}).content || '';\n}\n\n/**\n * Parse JSON out of a model response that may be fenced or wrapped in prose.\n * Returns null rather than throwing — callers treat null as a failed attempt.\n */\nfunction readJsonLoose(text) {\n  const raw = String(text || '').trim();\n  if (!raw) return null;\n  try {\n    return JSON.parse(raw);\n  } catch {\n    /* fall through */\n  }\n  const fenced = /```(?:json)?\\s*([\\s\\S]*?)```/.exec(raw);\n  const braced = /\\{[\\s\\S]*\\}/.exec(raw);\n  const candidate = (fenced && fenced[1]) || (braced && braced[0]);\n  if (!candidate) return null;\n  try {\n    return JSON.parse(candidate);\n  } catch {\n    return null;\n  }\n}\n\n/**\n * The model sometimes puts the link or hashtags only in the structured fields\n * and omits them from post_text. Repair rather than reject: the guardrails\n * still get the final say on whatever comes out of here.\n */\nfunction normalisePost(post, content) {\n  let text = String(post.post_text || '').trim();\n  if (!text) return { ...post, post_text: '' };\n\n  if (content.url && !text.includes(content.url)) {\n    text += `\\n${content.url}`;\n  }\n  const tags = Array.isArray(post.hashtags) ? post.hashtags : [];\n  if (tags.length && !/#[\\p{L}\\p{N}_]+/u.test(text)) {\n    text += `\\n${tags.join(' ')}`;\n  }\n  return { ...post, post_text: text };\n}\n\n// ---- node driver ----------------------------------------------------------\nconst base = $('Build Validator Request').first().json;\nconst raw = readCompletionText(\"openai\", $input.first().json);\nconst verdict = parseVerdict(raw);\n\nreturn [{ json: { ...base, verdict, verdictPassed: verdict.verdict === 'PASS', body: undefined } }];"
+      },
+      "id": "pw-022",
+      "name": "Parse Verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3340,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "pw-023",
+              "leftValue": "={{ $json.verdictPassed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "pw-024",
+      "name": "Validator Passed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3560,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Both guardrail layers funnel their rejections here. We feed the specific\n// violations back to the generator rather than simply re-rolling at a higher\n// temperature: a model told exactly which line broke which rule fixes it,\n// where a blind retry tends to reproduce the same mistake.\nconst d = $json;\nconst attempt = Number(d.attempt || 1);\n\nconst ruleViolations = ((d.rules && d.rules.violations) || [])\n  .map((v) => '- [' + v.rule + '] ' + v.detail + (v.evidence ? ' => \"' + v.evidence + '\"' : ''));\n\nconst reviewerViolations = ((d.verdict && d.verdict.reviewerViolations) || [])\n  .map((v) => '- [' + (v.rule || 'R?') + '] ' + (v.why || '') + (v.quote ? ' => \"' + v.quote + '\"' : ''));\n\nconst feedback = ['Rule checks:', ...ruleViolations, 'Reviewer:', ...reviewerViolations]\n  .filter(Boolean)\n  .join('\\n');\n\nconst exhausted = attempt >= Number(d.run.maxAttempts);\n\nreturn [{\n  json: {\n    ...d,\n    attempt: attempt + 1,\n    feedback,\n    retriesExhausted: exhausted,\n    canRetry: !exhausted,\n    rejectionReason: feedback,\n  },\n}];"
+      },
+      "id": "pw-025",
+      "name": "Prepare Retry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2900,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "pw-026",
+              "leftValue": "={{ $json.canRetry }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "pw-027",
+      "name": "Can Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3120,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $json;\nreturn [{ json: { ...d, needsApproval: d.run.reviewMode === 'approval' } }];"
+      },
+      "id": "pw-028",
+      "name": "Approval Required?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3780,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "pw-029",
+              "leftValue": "={{ $json.needsApproval }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "pw-030",
+      "name": "Approval Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4000,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The reviewer gets the post exactly as it will appear, the guardrail results,\n// and two one-click links. The links are this execution's resume URL with a\n// decision flag, so approving is a tap on a phone — no n8n login required.\nconst d = $json;\nconst resume = $execution.resumeUrl;\n\nconst advisories = ((d.rules && d.rules.advisories) || [])\n  .map((a) => '• ' + a.rule + ': ' + a.detail)\n  .join('\\n') || '• none';\n\nconst message = [\n  '<b>PlacidWay draft — ' + d.run.contentType + '</b>',\n  '',\n  '<b>Source:</b> ' + d.content.title,\n  d.content.url,\n  '',\n  '<b>Post:</b>',\n  '<pre>' + String(d.post.post_text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>',\n  '',\n  'Length before link: ' + d.rules.metrics.lengthBeforeLink + '/' + d.run.maxChars,\n  'Hashtags: ' + d.rules.metrics.hashtagCount,\n  'Attempts: ' + d.attempt,\n  'Image: ' + (d.content.image ? 'yes' : 'none'),\n  '',\n  '<b>Advisories:</b>',\n  advisories,\n  '',\n  '<a href=\"' + resume + '?decision=approve\">APPROVE</a>  |  <a href=\"' + resume + '?decision=reject\">REJECT</a>',\n].join('\\n');\n\nreturn [{ json: { ...d, reviewMessage: message, resumeUrl: resume } }];"
+      },
+      "id": "pw-031",
+      "name": "Build Review Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4220,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.PW_TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.reviewMessage }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "pw-032",
+      "name": "Send Draft To Reviewer",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        4440,
+        -320
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PW_TELEGRAM",
+          "name": "PlacidWay alert bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "limitWaitTime": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 24,
+        "resumeUnit": "hours",
+        "options": {
+          "webhookSuffix": ""
+        }
+      },
+      "id": "pw-033",
+      "name": "Wait For Approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        4660,
+        -320
+      ],
+      "webhookId": "a1f0c4de-0000-4000-8000-000000000002",
+      "notes": "Resumes when the reviewer opens one of the two links. Times out after 24h, which routes to Record Outcome as expired."
+    },
+    {
+      "parameters": {
+        "jsCode": "// The Wait node hands us the inbound request. A timeout resumes with no\n// query at all, which we treat as \"expired\" — never as an approval.\nconst d = $('Build Review Message').first().json;\nconst incoming = $input.first().json || {};\nconst query = incoming.query || {};\nconst decision = String(query.decision || '').toLowerCase();\n\nconst approved = decision === 'approve';\nconst outcome = decision === 'approve' ? 'approved'\n  : decision === 'reject' ? 'rejected'\n  : 'expired';\n\nreturn [{ json: { ...d, approved, approvalOutcome: outcome } }];"
+      },
+      "id": "pw-034",
+      "name": "Read Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4880,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "pw-035",
+              "leftValue": "={{ $json.approved }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "pw-036",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5100,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decides the Graph API call without branching the canvas three ways.\n//\n//  image present -> POST /{page}/photos  (url + caption)\n//  no image      -> POST /{page}/feed    (message + link, so FB renders a card)\n//\n// publishMode:\n//  simulate -> skip the call entirely; the run is still fully logged\n//  schedule -> published=false + scheduled_publish_time (FB requires 10m-6mo out)\n//  publish  -> live\nconst d = $json;\nconst run = d.run;\nconst hasImage = Boolean(d.content.image);\n\nconst edge = hasImage ? 'photos' : 'feed';\nconst endpoint = 'https://graph.facebook.com/' + run.graphVersion + '/' + run.facebookPageId + '/' + edge;\n\nconst body = hasImage\n  ? { url: d.content.image, caption: d.post.post_text }\n  : { message: d.post.post_text, link: d.content.url };\n\nif (run.publishMode === 'schedule') {\n  const offset = Math.max(15, Number(run.scheduleOffsetMinutes || 60));\n  body.published = false;\n  body.scheduled_publish_time = Math.floor(Date.now() / 1000) + offset * 60;\n} else if (run.publishMode === 'publish') {\n  body.published = true;\n}\n\nconst skip = run.publishMode === 'simulate';\nif (!skip && !run.facebookPageId) {\n  throw new Error('PW_PUBLISH_MODE=' + run.publishMode + ' but PW_FB_PAGE_ID is not set.');\n}\n\nreturn [{ json: { ...d, publish: { endpoint, edge, body, skip, mode: run.publishMode, hasImage } } }];"
+      },
+      "id": "pw-037",
+      "name": "Build Publish Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5320,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "pw-038",
+              "leftValue": "={{ $json.publish.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "pw-039",
+      "name": "Simulate Only?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5540,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.publish.endpoint }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.publish.body) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "pw-040",
+      "name": "Post To Facebook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5760,
+        -120
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PW_FACEBOOK",
+          "name": "Facebook Page token (Authorization: Bearer)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "notes": "Page access token lives in a header-auth credential, so it never appears in this export."
+    },
+    {
+      "parameters": {
+        "jsCode": "// One row per run, whatever happened. This is both the dedupe store and the\n// audit trail, which is why rejected and failed runs are written too.\nfunction resolve(nodeName) {\n  try { return $(nodeName).first().json; } catch (e) { return null; }\n}\n\nconst published = resolve('Post To Facebook');\nconst d = resolve('Build Publish Request') || resolve('Prepare Retry') || $json;\n\nconst fbId = published ? (published.post_id || published.id || '') : '';\n\nlet status;\nif (d.retriesExhausted) status = 'rejected';\nelse if (d.approvalOutcome === 'rejected') status = 'rejected';\nelse if (d.approvalOutcome === 'expired') status = 'expired';\nelse if (d.publish && d.publish.skip) status = 'simulated';\nelse if (d.publish && d.publish.mode === 'schedule') status = 'scheduled';\nelse if (fbId) status = 'published';\nelse status = 'unknown';\n\nconst row = {\n  run_id: d.run.runId,\n  run_at: d.run.runAt,\n  content_type: d.run.contentType,\n  url: (d.content && d.content.url) || (d.item && d.item.url) || '',\n  title: (d.content && d.content.title) || '',\n  image: (d.content && d.content.image) || '',\n  extracted_by: (d.content && d.content.extractedBy) || '',\n  post_text: (d.post && d.post.post_text) || '',\n  attempts: d.attempt || 1,\n  rule_status: d.rules ? (d.rules.passed ? 'pass' : 'fail') : 'n/a',\n  rule_violations: d.rules ? (d.rules.violations || []).map((v) => v.rule).join(', ') : '',\n  validator_status: d.verdict ? d.verdict.verdict : 'n/a',\n  validator_violations: d.verdict ? (d.verdict.reviewerViolations || []).map((v) => v.rule).join(', ') : '',\n  review_mode: d.run.reviewMode,\n  approval_outcome: d.approvalOutcome || 'n/a',\n  publish_mode: d.run.publishMode,\n  fb_post_id: fbId,\n  status,\n  error: d.rejectionReason || '',\n};\n\nreturn [{ json: { ...d, row, status } }];"
+      },
+      "id": "pw-041",
+      "name": "Record Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5980,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $json.run.sheetId }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "runs",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "matchingColumns": [],
+          "value": {}
+        },
+        "options": {}
+      },
+      "id": "pw-042",
+      "name": "Append To Run Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        6200,
+        -220
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PW_GOOGLE_SHEETS",
+          "name": "PlacidWay Google Sheets"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Record Outcome').first().json;\nreturn [{\n  json: {\n    runId: d.row.run_id,\n    status: d.row.status,\n    contentType: d.row.content_type,\n    url: d.row.url,\n    title: d.row.title,\n    attempts: d.row.attempts,\n    facebookPostId: d.row.fb_post_id || null,\n    post: d.row.post_text,\n  },\n}];"
+      },
+      "id": "pw-043",
+      "name": "Run Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6420,
+        -220
+      ]
+    }
+  ],
+  "connections": {
+    "Daily Schedule": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Pick Content Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Content Type": {
+      "main": [
+        [
+          {
+            "node": "Fetch Sitemap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Sitemap": {
+      "main": [
+        [
+          {
+            "node": "Parse Sitemap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Sitemap": {
+      "main": [
+        [
+          {
+            "node": "Load Posted Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Posted Log": {
+      "main": [
+        [
+          {
+            "node": "Choose Unposted Item",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Choose Unposted Item": {
+      "main": [
+        [
+          {
+            "node": "Respect Crawl Delay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respect Crawl Delay": {
+      "main": [
+        [
+          {
+            "node": "Fetch Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Page": {
+      "main": [
+        [
+          {
+            "node": "Extract Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Content": {
+      "main": [
+        [
+          {
+            "node": "Usable Content?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Usable Content?": {
+      "main": [
+        [
+          {
+            "node": "Build Generator Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Generator Request": {
+      "main": [
+        [
+          {
+            "node": "Generate Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Post": {
+      "main": [
+        [
+          {
+            "node": "Parse Generated Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Generated Post": {
+      "main": [
+        [
+          {
+            "node": "Rule Checks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rule Checks": {
+      "main": [
+        [
+          {
+            "node": "Rules Passed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rules Passed?": {
+      "main": [
+        [
+          {
+            "node": "Build Validator Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Retry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Validator Request": {
+      "main": [
+        [
+          {
+            "node": "Validate Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Post": {
+      "main": [
+        [
+          {
+            "node": "Parse Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Verdict": {
+      "main": [
+        [
+          {
+            "node": "Validator Passed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validator Passed?": {
+      "main": [
+        [
+          {
+            "node": "Approval Required?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Retry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Retry": {
+      "main": [
+        [
+          {
+            "node": "Can Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Can Retry?": {
+      "main": [
+        [
+          {
+            "node": "Build Generator Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval Required?": {
+      "main": [
+        [
+          {
+            "node": "Approval Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval Mode?": {
+      "main": [
+        [
+          {
+            "node": "Build Review Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Publish Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Review Message": {
+      "main": [
+        [
+          {
+            "node": "Send Draft To Reviewer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Draft To Reviewer": {
+      "main": [
+        [
+          {
+            "node": "Wait For Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait For Approval": {
+      "main": [
+        [
+          {
+            "node": "Read Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Decision": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Build Publish Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Publish Request": {
+      "main": [
+        [
+          {
+            "node": "Simulate Only?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Only?": {
+      "main": [
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Post To Facebook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post To Facebook": {
+      "main": [
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Outcome": {
+      "main": [
+        [
+          {
+            "node": "Append To Run Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append To Run Log": {
+      "main": [
+        [
+          {
+            "node": "Run Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "errorWorkflow": "={{ $env.PW_ERROR_WORKFLOW_ID }}",
+    "timezone": "Asia/Jakarta"
+  },
+  "pinData": {},
+  "meta": {
+    "builtBy": "scripts/build-workflow.mjs",
+    "builtAt": "2026-11-10T09:05:02.789Z",
+    "provider": "openai",
+    "note": "Generated file. Edit lib/*.js and prompts/*.md, then re-run npm run build."
+  }
+}

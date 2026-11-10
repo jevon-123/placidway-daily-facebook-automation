@@ -1,0 +1,130 @@
+{
+  "name": "PlacidWay — Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "pwe-001",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -280,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn n8n's error payload into something a human can act on at 07:03.\n// The classification matters: a 500 from PlacidWay is \"wait and see\", an\n// expired token is \"go and fix it now\", and the two should not look alike.\nconst e = $json.execution || {};\nconst w = $json.workflow || {};\nconst err = e.error || {};\n\nconst message = String(err.message || 'Unknown error');\nconst nodeName = (err.node && err.node.name) || e.lastNodeExecuted || 'unknown node';\nconst status = Number((err.httpCode != null ? err.httpCode : (err.statusCode != null ? err.statusCode : 0))) || null;\n\nfunction classify() {\n  const m = message.toLowerCase();\n  if (/session has expired|access token|oauthexception|code 190|invalid_token|unauthorized/.test(m) || status === 401) {\n    return { kind: 'AUTH', severity: 'page', hint: 'A token expired or was revoked. Refresh the Facebook Page token or re-authorise the Google/LLM credential. The daily run is blocked until this is fixed.' };\n  }\n  if (/rate limit|too many requests|quota|insufficient_quota/.test(m) || status === 429) {\n    return { kind: 'RATE_LIMIT', severity: 'warn', hint: 'We are being throttled. No action needed unless it repeats tomorrow; consider lowering PW_CANDIDATE_LIMIT or the schedule frequency.' };\n  }\n  if (status != null && status >= 500) {\n    return { kind: 'UPSTREAM_5XX', severity: 'warn', hint: 'The upstream service failed after our retries. Usually transient — the next scheduled run should recover.' };\n  }\n  if (/etimedout|econnreset|enotfound|socket hang up|network/.test(m)) {\n    return { kind: 'NETWORK', severity: 'warn', hint: 'Network-level failure reaching an upstream host. Transient in almost all cases.' };\n  }\n  if (/no unposted/.test(m)) {\n    return { kind: 'CONTENT_EXHAUSTED', severity: 'warn', hint: 'Every recent item of this content type has already been posted. Raise PW_CANDIDATE_LIMIT or widen the rotation.' };\n  }\n  if (/sitemap/.test(m)) {\n    return { kind: 'EXTRACTION', severity: 'page', hint: 'The sitemap did not look like we expect. PlacidWay may have changed its structure — re-run scripts/test-guardrails.mjs against fresh fixtures.' };\n  }\n  return { kind: 'UNCLASSIFIED', severity: 'page', hint: 'Not a failure mode we have seen before. Open the execution and read the stack.' };\n}\n\nconst c = classify();\nconst executionUrl = e.url || '';\n\nconst text = [\n  (c.severity === 'page' ? '\\u{1F534}' : '\\u{1F7E0}') + ' <b>PlacidWay automation failed</b>',\n  '',\n  '<b>Workflow:</b> ' + (w.name || 'unknown'),\n  '<b>Failed at:</b> ' + nodeName,\n  '<b>Class:</b> ' + c.kind + (status ? ' (HTTP ' + status + ')' : ''),\n  '<b>Mode:</b> ' + (e.mode || 'unknown'),\n  '',\n  '<b>Error:</b>',\n  '<pre>' + message.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').slice(0, 600) + '</pre>',\n  '',\n  '<b>What to do:</b>',\n  c.hint,\n  executionUrl ? '\\n<a href=\"' + executionUrl + '\">Open the execution</a>' : '',\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    kind: c.kind,\n    severity: c.severity,\n    nodeName,\n    status,\n    message,\n    hint: c.hint,\n    executionUrl,\n    workflowName: w.name || '',\n    alertText: text,\n    failedAt: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "pwe-002",
+      "name": "Classify Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -60,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.PW_TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.alertText }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "pwe-003",
+      "name": "Send Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        160,
+        -100
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PW_TELEGRAM",
+          "name": "PlacidWay alert bot"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "continueRegularOutput so that a Telegram outage still lets the failure reach the sheet."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.PW_SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "errors",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "matchingColumns": [],
+          "value": {}
+        },
+        "options": {}
+      },
+      "id": "pwe-004",
+      "name": "Log Failure",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        160,
+        100
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PW_GOOGLE_SHEETS",
+          "name": "PlacidWay Google Sheets"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Classify Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Failure": {
+      "main": [
+        [
+          {
+            "node": "Send Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Jakarta"
+  },
+  "pinData": {},
+  "meta": {
+    "builtBy": "scripts/build-error-workflow.mjs",
+    "builtAt": "2026-11-10T08:58:42.299Z",
+    "note": "Generated file. Set this as the Error Workflow of the main workflow."
+  }
+}

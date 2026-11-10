@@ -1,0 +1,17 @@
+node_modules/
+
+# Secrets. .env.example is committed; .env never is.
+.env
+.env.local
+
+# Dry-run artefacts. samples/sample-posts.md IS committed — it is a deliverable.
+samples/generated/
+samples/dry-run-state.json
+
+# Fixtures under samples/fixtures/ ARE committed on purpose: npm test needs
+# them, and a fixture made of our own assumptions would never catch PlacidWay
+# changing their markup.
+
+.DS_Store
+Thumbs.db
+*.log

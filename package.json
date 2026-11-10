@@ -1,0 +1,15 @@
+{
+  "name": "placidway-daily-facebook",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Daily PlacidWay -> Facebook content automation. n8n workflow plus the extraction and guardrail logic it embeds.",
+  "scripts": {
+    "build": "node scripts/build-workflow.mjs",
+    "dry-run": "node scripts/dry-run.mjs",
+    "test": "node scripts/test-guardrails.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

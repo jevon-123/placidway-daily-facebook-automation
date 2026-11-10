@@ -1,0 +1,58 @@
+{
+  "_comment": [
+    "Reference drafts used to exercise the guardrails and to seed samples/sample-posts.md.",
+    "",
+    "PROVENANCE: these were written by hand against prompts/generator.md, not emitted by",
+    "a model, because building them did not require an API key. The guardrail results",
+    "printed next to them in sample-posts.md are real — produced by lib/guardrails.js",
+    "against the real extracted page content in samples/fixtures/.",
+    "",
+    "To replace them with genuine model output, set OPENAI_API_KEY (or ANTHROPIC_API_KEY)",
+    "and run:  npm run dry-run -- --count=3",
+    "then:     node scripts/make-samples.mjs --from=dry-run",
+    "",
+    "The two entries with expect: \"fail\" exist to demonstrate rejection. Keep them."
+  ],
+  "posts": [
+    {
+      "id": "ivf-mexico-usa",
+      "fixture": "article",
+      "expect": "pass",
+      "allowPriceMention": false,
+      "note": "Article with no published price. Carries no figures at all, which is the safest shape for an evergreen post.",
+      "post_text": "The quote that looked affordable was not the whole budget.\n\nA base-cycle price says nothing about medications, testing or a second transfer.\nInsurance at home may cover bloodwork and still not cover the procedure abroad.\nRetrieval dates follow your body, not your airline booking.\n\nCompare what each option actually includes before you book anything.\nhttps://www.placidway.com/article/5596/IVF-in-Mexico-vs-USA-A-Complete-Guide-for-Couples\n#IVFAbroad #FertilityPlanning #MedicalTourism #PatientGuide"
+    },
+    {
+      "id": "tijuana-rehab-timing",
+      "fixture": "article-rehab",
+      "expect": "pass",
+      "allowPriceMention": false,
+      "note": "Article on scheduling. Every line maps to a question the source tells patients to ask.",
+      "post_text": "The admission week and the family wedding sat on two different calendars.\n\nAsk whether detox is on site, arranged elsewhere, or not offered at all.\nCheck intake availability against public holidays and border crossing times.\nRequest a written discharge and aftercare plan before you commit to a date.\n\nRead how patients think through the timing of a stay.\nhttps://www.placidway.com/article/5672/Tijuana-Drug-Rehab-Why-Patients-Choose-Mexico-for-Recovery-and-Healing\n#AddictionRecovery #RehabAbroad #MedicalTourism #RecoveryPlanning"
+    },
+    {
+      "id": "kfshrc-mastectomy-package",
+      "fixture": "package",
+      "expect": "pass",
+      "allowPriceMention": true,
+      "note": "Package with a structured price. Run with PW_ALLOW_PRICE_MENTION=true: every figure is checked against the page's own JSON-LD offers block.",
+      "post_text": "Planning cancer surgery abroad starts with knowing what a price actually covers.\n\nThe unilateral mastectomy package at KFSHRC in Riyadh is listed at $16,000, all-inclusive.\nLength of stay is 1-2 days inpatient, with 7-14 days of outpatient drain management.\nSentinel lymph node biopsy is included where clinically indicated.\n\nSee the full package and what the bundle contains.\nhttps://www.placidway.com/package/8675/Unilateral-Mastectomy-for-Breast-Cancer-Package-in-Riyadh-Saudi-Arabia-at-KFSHRC\n#BreastCancerCare #SurgicalOncology #MedicalTourism #SaudiArabia"
+    },
+    {
+      "id": "rejected-medical-claims",
+      "fixture": "article",
+      "expect": "fail",
+      "allowPriceMention": false,
+      "note": "Deliberately bad. Demonstrates the claim and grounding rules firing together.",
+      "post_text": "IVF abroad can finally cure infertility for couples who have waited years.\n\nClinics in Cancun report a 92% success rate for patients under 40.\nThe procedure is completely painless and risk-free.\nResults are guaranteed or your money back.\n\nStart your journey today.\nhttps://www.placidway.com/article/5596/IVF-in-Mexico-vs-USA-A-Complete-Guide-for-Couples\n#IVF #Fertility #FertilityAbroad"
+    },
+    {
+      "id": "rejected-invented-price",
+      "fixture": "article-rehab",
+      "expect": "fail",
+      "allowPriceMention": false,
+      "note": "Deliberately bad. The price is invented, the superlative is unverifiable, and the recovery promise is a medical claim.",
+      "post_text": "Residential rehab in Tijuana starts at just $4,500 for a 30-day program.\n\nThe best clinics in Mexico guarantee a full recovery.\nMost patients return home completely drug-free within one month.\n\nSecure your spot now.\nhttps://www.placidway.com/article/5672/Tijuana-Drug-Rehab-Why-Patients-Choose-Mexico-for-Recovery-and-Healing\n#Rehab #Recovery #Tijuana #Detox"
+    }
+  ]
+}
