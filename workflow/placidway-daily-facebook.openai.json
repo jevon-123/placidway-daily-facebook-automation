@@ -1255,7 +1255,7 @@
   "pinData": {},
   "meta": {
     "builtBy": "scripts/build-workflow.mjs",
-    "builtAt": "2026-11-10T09:05:02.789Z",
+    "builtAt": "2026-11-10T09:09:09.959Z",
     "provider": "openai",
     "note": "Generated file. Edit lib/*.js and prompts/*.md, then re-run npm run build."
   }
