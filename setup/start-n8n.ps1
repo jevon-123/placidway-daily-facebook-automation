@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Starts n8n with every environment variable this project needs.
 
@@ -10,7 +10,7 @@
   Starts n8n with a public tunnel URL. You need this for approval mode: the
   reviewer's Telegram message contains a resume link, and a link to
   http://localhost:5678 is useless on a phone. Do not use it for anything
-  other than a demo — it exposes your local n8n to the internet.
+  other than a demo - it exposes your local n8n to the internet.
 
 .EXAMPLE
   .\setup\start-n8n.ps1

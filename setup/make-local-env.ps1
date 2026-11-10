@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Creates setup/local.env.ps1 from a template, for the values that must not be
   committed.
@@ -12,7 +12,7 @@ $ErrorActionPreference = 'Stop'
 $target = Join-Path $PSScriptRoot 'local.env.ps1'
 
 if (Test-Path $target) {
-    Write-Host "setup/local.env.ps1 already exists — not touching it." -ForegroundColor Yellow
+    Write-Host "setup/local.env.ps1 already exists - not touching it." -ForegroundColor Yellow
     Write-Host "Open it and fill in whatever is still empty:" -ForegroundColor Yellow
     Write-Host "  notepad `"$target`"" -ForegroundColor Cyan
     exit 0

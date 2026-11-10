@@ -7,7 +7,7 @@
  *   node scripts/test-guardrails.mjs
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -187,6 +187,33 @@ check('reads a fenced verdict', parseVerdict('```json\n{"verdict":"PASS","violat
 check('reads a verdict with surrounding prose', parseVerdict('Here you go: {"verdict":"FAIL","violations":[{"rule":"R3"}]}').verdict === 'FAIL');
 check('fails closed on garbage', parseVerdict('the post looks fine to me').verdict === 'FAIL');
 check('fails closed on an unknown verdict', parseVerdict('{"verdict":"MAYBE"}').verdict === 'FAIL');
+
+// ---------------------------------------------------------------------------
+section('setup scripts are safe for Windows PowerShell 5.1');
+
+// 5.1 reads a .ps1 without a BOM using the system ANSI codepage. An em-dash is
+// E2 80 94 in UTF-8; byte 94 in CP1252 is a right double quote, which silently
+// breaks string parsing somewhere *else* in the file. The symptom was "the
+// string is missing the terminator" reported against a line that was perfectly
+// fine. Belt and braces: require the BOM, and keep the body ASCII anyway.
+const setupDir = join(here, '..', 'setup');
+if (existsSync(setupDir)) {
+  for (const file of readdirSync(setupDir).filter((f) => f.endsWith('.ps1'))) {
+    const text = readFileSync(join(setupDir, file), 'utf8');
+
+    check(`${file} starts with a UTF-8 BOM`, text.charCodeAt(0) === 0xfeff);
+
+    const body = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+    const offenders = [...new Set(body.match(/[^\x00-\x7F]/g) || [])];
+    check(
+      `${file} body is pure ASCII`,
+      offenders.length === 0,
+      offenders.map((c) => `U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')} '${c}'`).join(', '),
+    );
+  }
+} else {
+  console.log('  skip  setup/ not present');
+}
 
 // ---------------------------------------------------------------------------
 console.log(`\n${passed} passed, ${failed} failed\n`);

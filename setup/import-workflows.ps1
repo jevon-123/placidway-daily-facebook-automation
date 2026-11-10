@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Imports the built workflows into your local n8n and prints their IDs.
 
@@ -6,7 +6,7 @@
   Run this with n8n STOPPED. It writes straight to n8n's database; a running
   server will not notice the new rows until it restarts.
 
-  Importing does not bring credentials with it — those are created once in the
+  Importing does not bring credentials with it - those are created once in the
   UI and then attached to the nodes. That is deliberate on n8n's part: an
   exported workflow should never be able to carry your tokens.
 
@@ -40,7 +40,7 @@ $mainWorkflow  = Join-Path $ProjectRoot "workflow\placidway-daily-facebook.$Prov
 
 foreach ($f in @($errorWorkflow, $mainWorkflow)) {
     if (-not (Test-Path $f)) {
-        Write-Host "Missing $f — run: node scripts\build-workflow.mjs" -ForegroundColor Red
+        Write-Host "Missing $f - run: node scripts\build-workflow.mjs" -ForegroundColor Red
         exit 1
     }
 }
