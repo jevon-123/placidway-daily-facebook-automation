@@ -138,6 +138,21 @@ third fix matters more than either — `Parse Generated Post` now reports
 `finish_reason` in its failure message, because truncation and malformed output
 are indistinguishable downstream and have opposite remedies.
 
+**"And an integration bug?"**
+The Google Sheets node appends with `autoMapInputData`, which matches top-level
+keys against column names. `Record Outcome` was returning
+`{ ...envelope, row, status }`, so the only top-level key matching a column was
+`status`. No error — just one near-empty row. Worse, n8n *creates* a column for
+every unrecognised key, so that single run added seventeen junk columns named
+`run`, `content`, `rules`, `verdict`… and permanently widened the sheet.
+
+Three things came out of it: `Record Outcome` now emits the row object *as* the
+item; the Sheets nodes read the spreadsheet ID from `$('Config')` rather than
+from `$json`, because nodes downstream reshape the item freely; and
+`scripts/reset-sheet.mjs` can restore a sheet to its declared columns. The
+general lesson is that auto-mapping fails by writing something plausible rather
+than by raising, which is the worst failure mode to have in an audit trail.
+
 **"Doesn't dropping `response_format: json_object` make parsing fragile?"**
 No, because it was never relied on. `readJsonLoose()` strips code fences and
 finds the JSON object in prose, and a reply it still cannot parse becomes a

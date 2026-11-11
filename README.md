@@ -519,6 +519,18 @@ right now than the efficiency.
 Rows with `status` of `failed`, `rejected` or `expired` are deliberately **not**
 treated as used, so a transient outage does not silently burn a piece of content.
 
+One sharp edge worth knowing if you change `Record Outcome`. The Sheets node
+appends with `autoMapInputData`, which matches **top-level keys** against column
+names — and silently **creates a new column** for any key it does not recognise.
+An early version returned `{ ...envelope, row }`, so the only top-level key that
+matched a column was `status`. The result was not an error: it was one
+near-empty row, plus seventeen new columns named `run`, `content`, `rules`,
+`verdict` and so on, permanently widening the sheet for every future append.
+
+Hence `Record Outcome` emits the row object *as* the item, nothing else, and
+`scripts/reset-sheet.mjs` exists to put a sheet back to its declared columns
+when something has widened it.
+
 ### The build step
 
 n8n Code nodes cannot import files. The usual consequence is that the

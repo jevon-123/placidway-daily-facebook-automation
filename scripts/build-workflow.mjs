@@ -310,9 +310,13 @@ connect('Fetch Sitemap', 'Parse Sitemap');
 // Service account rather than OAuth2: no consent screen, no redirect URI, and
 // no re-authorising every few weeks. The trade is that the spreadsheet has to
 // be shared with the service account's email like any other collaborator.
+// The sheet ID is read from Config rather than from the incoming item.
+// Nodes downstream reshape the item freely — Record Outcome, for one, emits
+// just the sheet row — so depending on $json.run here is a dependency on
+// something no upstream node promises to preserve.
 node('Load Posted Log', 'n8n-nodes-base.googleSheets', 4.5, [480, -20], {
   authentication: 'serviceAccount',
-  documentId: { __rl: true, value: '={{ $json.run.sheetId }}', mode: 'id' },
+  documentId: { __rl: true, value: "={{ $('Config').first().json.run.sheetId }}", mode: 'id' },
   sheetName: { __rl: true, value: 'runs', mode: 'name' },
   options: {},
 }, {
@@ -894,7 +898,14 @@ const row = {
   error: d.rejectionReason || '',
 };
 
-return [{ json: { ...d, row, status } }];`,
+// The row object IS the output item, not a field on it.
+//
+// The Sheets node maps with autoMapInputData, which matches *top-level* keys
+// against column names. Returning { ...d, row } silently wrote a line with only
+// "status" filled in, because that was the one top-level key whose name matched
+// a column. Everything else sat one level down inside "row" and was dropped —
+// no error, just an almost-empty row in the audit trail.
+return [{ json: row }];`,
 );
 connect('Simulate Only?', 'Record Outcome', 0);
 connect('Post To Facebook', 'Record Outcome');
@@ -905,7 +916,7 @@ connect('Usable Content?', 'Record Outcome', 1);
 node('Append To Run Log', 'n8n-nodes-base.googleSheets', 4.5, [6200, -220], {
   authentication: 'serviceAccount',
   operation: 'append',
-  documentId: { __rl: true, value: '={{ $json.run.sheetId }}', mode: 'id' },
+  documentId: { __rl: true, value: "={{ $('Config').first().json.run.sheetId }}", mode: 'id' },
   sheetName: { __rl: true, value: 'runs', mode: 'name' },
   columns: { mappingMode: 'autoMapInputData', matchingColumns: [], value: {} },
   options: {},
@@ -917,17 +928,20 @@ connect('Record Outcome', 'Append To Run Log');
 code(
   'Run Summary',
   [6420, -220],
-  `const d = $('Record Outcome').first().json;
+  `// Record Outcome emits the sheet row itself, so these are its top-level keys.
+const row = $('Record Outcome').first().json;
 return [{
   json: {
-    runId: d.row.run_id,
-    status: d.row.status,
-    contentType: d.row.content_type,
-    url: d.row.url,
-    title: d.row.title,
-    attempts: d.row.attempts,
-    facebookPostId: d.row.fb_post_id || null,
-    post: d.row.post_text,
+    runId: row.run_id,
+    status: row.status,
+    contentType: row.content_type,
+    url: row.url,
+    title: row.title,
+    attempts: row.attempts,
+    ruleStatus: row.rule_status,
+    validatorStatus: row.validator_status,
+    facebookPostId: row.fb_post_id || null,
+    post: row.post_text,
   },
 }];`,
 );

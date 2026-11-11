@@ -114,7 +114,7 @@
         "authentication": "serviceAccount",
         "documentId": {
           "__rl": true,
-          "value": "={{ $json.run.sheetId }}",
+          "value": "={{ $('Config').first().json.run.sheetId }}",
           "mode": "id"
         },
         "sheetName": {
@@ -750,7 +750,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// One row per run, whatever happened. This is both the dedupe store and the\n// audit trail, which is why rejected and failed runs are written too.\nfunction resolve(nodeName) {\n  try { return $(nodeName).first().json; } catch (e) { return null; }\n}\n\nconst published = resolve('Post To Facebook');\nconst d = resolve('Build Publish Request') || resolve('Prepare Retry') || $json;\n\nconst fbId = published ? (published.post_id || published.id || '') : '';\n\nlet status;\nif (d.retriesExhausted) status = 'rejected';\nelse if (d.approvalOutcome === 'rejected') status = 'rejected';\nelse if (d.approvalOutcome === 'expired') status = 'expired';\nelse if (d.publish && d.publish.skip) status = 'simulated';\nelse if (d.publish && d.publish.mode === 'schedule') status = 'scheduled';\nelse if (fbId) status = 'published';\nelse status = 'unknown';\n\nconst row = {\n  run_id: d.run.runId,\n  run_at: d.run.runAt,\n  content_type: d.run.contentType,\n  url: (d.content && d.content.url) || (d.item && d.item.url) || '',\n  title: (d.content && d.content.title) || '',\n  image: (d.content && d.content.image) || '',\n  extracted_by: (d.content && d.content.extractedBy) || '',\n  post_text: (d.post && d.post.post_text) || '',\n  attempts: d.attempt || 1,\n  rule_status: d.rules ? (d.rules.passed ? 'pass' : 'fail') : 'n/a',\n  rule_violations: d.rules ? (d.rules.violations || []).map((v) => v.rule).join(', ') : '',\n  validator_status: d.verdict ? d.verdict.verdict : 'n/a',\n  validator_violations: d.verdict ? (d.verdict.reviewerViolations || []).map((v) => v.rule).join(', ') : '',\n  review_mode: d.run.reviewMode,\n  approval_outcome: d.approvalOutcome || 'n/a',\n  publish_mode: d.run.publishMode,\n  fb_post_id: fbId,\n  status: status,\n  error: d.rejectionReason || '',\n};\n\nreturn [{ json: { ...d, row, status } }];"
+        "jsCode": "// One row per run, whatever happened. This is both the dedupe store and the\n// audit trail, which is why rejected and failed runs are written too.\nfunction resolve(nodeName) {\n  try { return $(nodeName).first().json; } catch (e) { return null; }\n}\n\nconst published = resolve('Post To Facebook');\nconst d = resolve('Build Publish Request') || resolve('Prepare Retry') || $json;\n\nconst fbId = published ? (published.post_id || published.id || '') : '';\n\nlet status;\nif (d.retriesExhausted) status = 'rejected';\nelse if (d.approvalOutcome === 'rejected') status = 'rejected';\nelse if (d.approvalOutcome === 'expired') status = 'expired';\nelse if (d.publish && d.publish.skip) status = 'simulated';\nelse if (d.publish && d.publish.mode === 'schedule') status = 'scheduled';\nelse if (fbId) status = 'published';\nelse status = 'unknown';\n\nconst row = {\n  run_id: d.run.runId,\n  run_at: d.run.runAt,\n  content_type: d.run.contentType,\n  url: (d.content && d.content.url) || (d.item && d.item.url) || '',\n  title: (d.content && d.content.title) || '',\n  image: (d.content && d.content.image) || '',\n  extracted_by: (d.content && d.content.extractedBy) || '',\n  post_text: (d.post && d.post.post_text) || '',\n  attempts: d.attempt || 1,\n  rule_status: d.rules ? (d.rules.passed ? 'pass' : 'fail') : 'n/a',\n  rule_violations: d.rules ? (d.rules.violations || []).map((v) => v.rule).join(', ') : '',\n  validator_status: d.verdict ? d.verdict.verdict : 'n/a',\n  validator_violations: d.verdict ? (d.verdict.reviewerViolations || []).map((v) => v.rule).join(', ') : '',\n  review_mode: d.run.reviewMode,\n  approval_outcome: d.approvalOutcome || 'n/a',\n  publish_mode: d.run.publishMode,\n  fb_post_id: fbId,\n  status: status,\n  error: d.rejectionReason || '',\n};\n\n// The row object IS the output item, not a field on it.\n//\n// The Sheets node maps with autoMapInputData, which matches *top-level* keys\n// against column names. Returning { ...d, row } silently wrote a line with only\n// \"status\" filled in, because that was the one top-level key whose name matched\n// a column. Everything else sat one level down inside \"row\" and was dropped —\n// no error, just an almost-empty row in the audit trail.\nreturn [{ json: row }];"
       },
       "id": "pw-041",
       "name": "Record Outcome",
@@ -767,7 +767,7 @@
         "operation": "append",
         "documentId": {
           "__rl": true,
-          "value": "={{ $json.run.sheetId }}",
+          "value": "={{ $('Config').first().json.run.sheetId }}",
           "mode": "id"
         },
         "sheetName": {
@@ -799,7 +799,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const d = $('Record Outcome').first().json;\nreturn [{\n  json: {\n    runId: d.row.run_id,\n    status: d.row.status,\n    contentType: d.row.content_type,\n    url: d.row.url,\n    title: d.row.title,\n    attempts: d.row.attempts,\n    facebookPostId: d.row.fb_post_id || null,\n    post: d.row.post_text,\n  },\n}];"
+        "jsCode": "// Record Outcome emits the sheet row itself, so these are its top-level keys.\nconst row = $('Record Outcome').first().json;\nreturn [{\n  json: {\n    runId: row.run_id,\n    status: row.status,\n    contentType: row.content_type,\n    url: row.url,\n    title: row.title,\n    attempts: row.attempts,\n    ruleStatus: row.rule_status,\n    validatorStatus: row.validator_status,\n    facebookPostId: row.fb_post_id || null,\n    post: row.post_text,\n  },\n}];"
       },
       "id": "pw-043",
       "name": "Run Summary",
@@ -1257,7 +1257,7 @@
   "pinData": {},
   "meta": {
     "builtBy": "scripts/build-workflow.mjs",
-    "builtAt": "2026-11-11T03:54:42.905Z",
+    "builtAt": "2026-11-11T04:24:57.334Z",
     "provider": "openai",
     "note": "Generated file. Edit lib/*.js and prompts/*.md, then re-run npm run build."
   }
