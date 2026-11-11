@@ -472,10 +472,14 @@ const LLM_HEADERS =
     ? [{ name: 'anthropic-version', value: '2023-06-01' }, { name: 'content-type', value: 'application/json' }]
     : [{ name: 'content-type', value: 'application/json' }];
 
+// Provider-neutral on purpose: this variant speaks the OpenAI wire format, but
+// the endpoint is set by PW_LLM_BASE_URL and is just as likely to be Gemini,
+// Groq or a local Ollama. Naming the credential "OpenAI" would be a lie on
+// most installs.
 const LLM_CREDENTIAL =
   PROVIDER === 'anthropic'
-    ? { httpHeaderAuth: { id: 'PW_ANTHROPIC', name: 'Anthropic API key (x-api-key)' } }
-    : { httpHeaderAuth: { id: 'PW_OPENAI', name: 'OpenAI API key (Authorization: Bearer)' } };
+    ? { httpHeaderAuth: { id: 'PW_ANTHROPIC', name: 'LLM API key (x-api-key)' } }
+    : { httpHeaderAuth: { id: 'PW_LLM', name: 'LLM API key (Authorization: Bearer)' } };
 
 function llmNode(name, position) {
   return node(name, 'n8n-nodes-base.httpRequest', 4.2, position, {

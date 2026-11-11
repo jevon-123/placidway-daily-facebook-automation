@@ -305,7 +305,7 @@
       "credentials": {
         "httpHeaderAuth": {
           "id": "PW_ANTHROPIC",
-          "name": "Anthropic API key (x-api-key)"
+          "name": "LLM API key (x-api-key)"
         }
       },
       "retryOnFail": true,
@@ -423,7 +423,7 @@
       "credentials": {
         "httpHeaderAuth": {
           "id": "PW_ANTHROPIC",
-          "name": "Anthropic API key (x-api-key)"
+          "name": "LLM API key (x-api-key)"
         }
       },
       "retryOnFail": true,
@@ -1265,7 +1265,7 @@
   "pinData": {},
   "meta": {
     "builtBy": "scripts/build-workflow.mjs",
-    "builtAt": "2026-11-11T03:49:20.967Z",
+    "builtAt": "2026-11-11T03:54:42.983Z",
     "provider": "anthropic",
     "note": "Generated file. Edit lib/*.js and prompts/*.md, then re-run npm run build."
   }
