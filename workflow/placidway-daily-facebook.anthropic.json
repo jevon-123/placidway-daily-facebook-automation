@@ -1258,14 +1258,14 @@
   "settings": {
     "executionOrder": "v1",
     "saveManualExecutions": true,
-    "saveExecutionProgress": true,
+    "saveExecutionProgress": false,
     "errorWorkflow": "={{ $env.PW_ERROR_WORKFLOW_ID }}",
     "timezone": "Asia/Jakarta"
   },
   "pinData": {},
   "meta": {
     "builtBy": "scripts/build-workflow.mjs",
-    "builtAt": "2026-11-11T08:55:14.682Z",
+    "builtAt": "2026-11-11T09:04:46.813Z",
     "provider": "anthropic",
     "note": "Generated file. Edit lib/*.js and prompts/*.md, then re-run npm run build."
   }

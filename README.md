@@ -332,8 +332,22 @@ for email means replacing two nodes; nothing else changes.
 the draft to Telegram, and waits. Approving writes a `simulated` row; nothing
 reaches Facebook.
 
-**Scheduled.** Activate the workflow. It fires at 07:00 in the workflow's
+**Scheduled.** Click **Publish**. It then fires at 07:00 in the workflow's
 timezone.
+
+Publishing is load-bearing in n8n 2.x, and in two ways that are easy to miss:
+
+- Scheduled triggers are registered from the *published* version. An
+  unpublished workflow has no `scheduled_task` row, so the cron simply never
+  runs. Setting `active = 1` in the database does not substitute for it.
+- The error workflow is dispatched only for production executions —
+  `dispatchesErrorWorkflow = !isManualMode` in n8n's execution lifecycle. A
+  failed *manual* run produces no alert and no `errors` row, and neither does
+  `n8n execute` from the CLI.
+
+So "it worked when I clicked Execute" does not establish that either the daily
+schedule or the alerting works. Those need a published workflow and a real
+scheduled run.
 
 **Going live.** Set `PW_PUBLISH_MODE=publish` once you have watched a few
 simulated runs and are happy with the copy.

@@ -292,6 +292,28 @@ will:
 Nothing reaches Facebook. When you are happy, set `PW_PUBLISH_MODE=publish` in
 `local.env.ps1` and restart.
 
+### Then publish the workflow — this is not optional
+
+**Execute Workflow is a manual run. It is not the same as the workflow being
+live, and two requirements depend on the difference.**
+
+Click **Publish** (top right). Until you do:
+
+- **The daily schedule never fires.** n8n 2.x registers scheduled triggers from
+  the *published* version. An unpublished workflow has no entry in
+  `scheduled_task`, so 07:00 comes and goes with nothing happening. Setting
+  `active = 1` in the database directly does **not** work — publishing is what
+  creates the published-version row the scheduler reads.
+- **The error workflow never fires.** n8n dispatches it only for production
+  executions: `dispatchesErrorWorkflow = !isManualMode`. A manual run that fails
+  produces no Telegram alert and no row in the `errors` tab. So does
+  `n8n execute` from the CLI.
+
+This matters for the recording. If you demonstrate a failure by clicking
+Execute, no alert appears, and it looks like the error handling does not work.
+To show it genuinely: publish the workflow, break something (an invalid
+`PW_LLM_BASE_URL` is the easiest), and let a scheduled run fail.
+
 > **For the recording:** start n8n with `.\setup\start-n8n.ps1 -Tunnel`. The
 > approval link in Telegram is built from n8n's own URL, and a link to
 > `localhost` does not work on a phone. The tunnel exposes your local n8n to

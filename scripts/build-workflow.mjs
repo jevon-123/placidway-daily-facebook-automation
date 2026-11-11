@@ -990,7 +990,15 @@ const workflow = {
   settings: {
     executionOrder: 'v1',
     saveManualExecutions: true,
-    saveExecutionProgress: true,
+    // Deliberately OFF. With it on, n8n rewrites the entire execution payload
+    // to the database after *every* node — and this workflow carries a 2.3 MB
+    // sitemap plus ~400 kB of page HTML, so each step became a multi-megabyte
+    // SQLite write and a run that takes 20 seconds took minutes.
+    //
+    // What it costs: no partial node data if the process dies mid-run. That is
+    // an acceptable trade here, because every run is recorded in the Google
+    // Sheet either way and the error workflow fires on any throw.
+    saveExecutionProgress: false,
     errorWorkflow: '={{ $env.PW_ERROR_WORKFLOW_ID }}',
     timezone: 'Asia/Jakarta',
   },

@@ -1,6 +1,6 @@
 /**
- * Points the imported workflows at the credentials that actually exist on this
- * n8n instance, matching them by name.
+ * Points the imported workflows at the things that only exist on *this* n8n
+ * instance: the credentials, and the error workflow. Both are matched by name.
  *
  * Why this exists: the workflow JSON in workflow/ carries placeholder credential
  * IDs (PW_GOOGLE_SHEETS, PW_LLM, ...). Real IDs are assigned per instance, so
@@ -64,17 +64,51 @@ console.log(`credentials on this instance: ${credentials.length}`);
 for (const c of credentials) console.log(`  ${c.id.padEnd(20)} ${c.type.padEnd(18)} ${c.name}`);
 console.log('');
 
+// --- find the error handler so the main workflow can point at it -----------
+//
+// settings.errorWorkflow has to be a literal workflow ID. n8n does NOT evaluate
+// expressions in workflow settings, so the "={{ $env.PW_ERROR_WORKFLOW_ID }}"
+// the build emits never resolves — the error workflow simply never fires, with
+// no warning anywhere. Resolve it here, by name, like the credentials.
+
+const ERROR_WORKFLOW_NAME = 'PlacidWay - Error Handler';
+const errorWorkflow = (
+  await all('SELECT id, name FROM workflow_entity WHERE name = ?', [ERROR_WORKFLOW_NAME])
+)[0];
+
+if (errorWorkflow) {
+  console.log(`error workflow: ${errorWorkflow.id}  ${errorWorkflow.name}\n`);
+} else {
+  console.log(`error workflow: not found (expected one named "${ERROR_WORKFLOW_NAME}")\n`);
+}
+
 // --- rewrite each workflow's credential references -------------------------
 
 let linked = 0;
 let unresolved = 0;
 let touched = 0;
 
-for (const w of await all("SELECT id, name, nodes FROM workflow_entity WHERE name LIKE 'PlacidWay%'")) {
+for (const w of await all("SELECT id, name, nodes, settings FROM workflow_entity WHERE name LIKE 'PlacidWay%'")) {
   const nodes = typeof w.nodes === 'string' ? JSON.parse(w.nodes) : w.nodes;
+  const settings = w.settings
+    ? (typeof w.settings === 'string' ? JSON.parse(w.settings) : w.settings)
+    : {};
   let changed = false;
+  let settingsChanged = false;
 
   console.log(`${w.name}  (${w.id})`);
+
+  // The error handler must not point at itself.
+  if (errorWorkflow && w.id !== errorWorkflow.id) {
+    if (settings.errorWorkflow !== errorWorkflow.id) {
+      console.log(`  link  ${'(settings.errorWorkflow)'.padEnd(24)} ${settings.errorWorkflow || '(unset)'} -> ${errorWorkflow.id}`);
+      settings.errorWorkflow = errorWorkflow.id;
+      settingsChanged = true;
+      linked += 1;
+    } else {
+      console.log(`  ok    ${'(settings.errorWorkflow)'.padEnd(24)} already linked`);
+    }
+  }
 
   for (const node of nodes) {
     if (!node.credentials) continue;
@@ -99,9 +133,10 @@ for (const w of await all("SELECT id, name, nodes FROM workflow_entity WHERE nam
     }
   }
 
-  if (changed && !DRY_RUN) {
-    await run('UPDATE workflow_entity SET nodes = ?, updatedAt = ? WHERE id = ?', [
+  if ((changed || settingsChanged) && !DRY_RUN) {
+    await run('UPDATE workflow_entity SET nodes = ?, settings = ?, updatedAt = ? WHERE id = ?', [
       JSON.stringify(nodes),
+      JSON.stringify(settings),
       new Date().toISOString().replace('T', ' ').replace('Z', ''),
       w.id,
     ]);
