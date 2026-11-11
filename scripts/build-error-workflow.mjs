@@ -135,6 +135,7 @@ node(
   4.5,
   [160, 100],
   {
+    authentication: 'serviceAccount',
     operation: 'append',
     documentId: { __rl: true, value: '={{ $env.PW_SHEET_ID }}', mode: 'id' },
     sheetName: { __rl: true, value: 'errors', mode: 'name' },
@@ -142,14 +143,15 @@ node(
     options: {},
   },
   {
-    credentials: { googleSheetsOAuth2Api: { id: 'PW_GOOGLE_SHEETS', name: 'PlacidWay Google Sheets' } },
+    credentials: { googleApi: { id: 'PW_GOOGLE_SHEETS', name: 'PlacidWay Google Sheets' } },
     onError: 'continueRegularOutput',
   },
 );
 connect('Classify Failure', 'Log Failure');
 
 const workflow = {
-  name: 'PlacidWay — Error Handler',
+  // ASCII hyphen - see the note on the main workflow's name.
+  name: 'PlacidWay - Error Handler',
   nodes,
   connections,
   settings: { executionOrder: 'v1', timezone: 'Asia/Jakarta' },

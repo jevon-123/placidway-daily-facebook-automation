@@ -307,13 +307,17 @@ connect('Fetch Sitemap', 'Parse Sitemap');
 // 3. Deduplicate against the run log
 // ---------------------------------------------------------------------------
 
+// Service account rather than OAuth2: no consent screen, no redirect URI, and
+// no re-authorising every few weeks. The trade is that the spreadsheet has to
+// be shared with the service account's email like any other collaborator.
 node('Load Posted Log', 'n8n-nodes-base.googleSheets', 4.5, [480, -20], {
+  authentication: 'serviceAccount',
   documentId: { __rl: true, value: '={{ $json.run.sheetId }}', mode: 'id' },
   sheetName: { __rl: true, value: 'runs', mode: 'name' },
   options: {},
 }, {
   alwaysOutputData: true,
-  credentials: { googleSheetsOAuth2Api: { id: 'PW_GOOGLE_SHEETS', name: 'PlacidWay Google Sheets' } },
+  credentials: { googleApi: { id: 'PW_GOOGLE_SHEETS', name: 'PlacidWay Google Sheets' } },
   notes: 'Reads every row of the run log. Fails loudly: if we cannot read what was already posted, we must not post.',
 });
 connect('Parse Sitemap', 'Load Posted Log');
@@ -895,13 +899,14 @@ connect('Approved?', 'Record Outcome', 1);
 connect('Usable Content?', 'Record Outcome', 1);
 
 node('Append To Run Log', 'n8n-nodes-base.googleSheets', 4.5, [6200, -220], {
+  authentication: 'serviceAccount',
   operation: 'append',
   documentId: { __rl: true, value: '={{ $json.run.sheetId }}', mode: 'id' },
   sheetName: { __rl: true, value: 'runs', mode: 'name' },
   columns: { mappingMode: 'autoMapInputData', matchingColumns: [], value: {} },
   options: {},
 }, {
-  credentials: { googleSheetsOAuth2Api: { id: 'PW_GOOGLE_SHEETS', name: 'PlacidWay Google Sheets' } },
+  credentials: { googleApi: { id: 'PW_GOOGLE_SHEETS', name: 'PlacidWay Google Sheets' } },
 });
 connect('Record Outcome', 'Append To Run Log');
 
@@ -929,7 +934,12 @@ connect('Append To Run Log', 'Run Summary');
 // ---------------------------------------------------------------------------
 
 const workflow = {
-  name: `PlacidWay — Daily Facebook Post (${PROVIDER})`,
+  // ASCII hyphen, not an em-dash. The workflow name is matched against
+  // `n8n list:workflow` output by setup/import-workflows.ps1 so that a
+  // re-import updates in place, and Windows PowerShell mangles non-ASCII
+  // characters when reading either the file or the CLI output. An en-dash here
+  // silently turns every re-import into a duplicate.
+  name: `PlacidWay - Daily Facebook Post (${PROVIDER})`,
   nodes,
   connections,
   settings: {

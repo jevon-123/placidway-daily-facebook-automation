@@ -44,12 +44,48 @@ foreach ($f in @($errorWorkflow, $mainWorkflow)) {
     }
 }
 
-# Error handler first: the main workflow needs its ID.
-Write-Host "Importing the error handler..." -ForegroundColor Cyan
-& $n8nCmd import:workflow --input="$errorWorkflow"
+# --- what is already there -------------------------------------------------
+# list:workflow prints "<id>|<name>" per line. Reusing an existing ID turns the
+# import into an update; without it every run of this script would create
+# another copy. You will re-import after every build, so this matters.
 
-Write-Host "Importing the main workflow ($Provider)..." -ForegroundColor Cyan
-& $n8nCmd import:workflow --input="$mainWorkflow"
+$nodeExe = Join-Path $NodeDir 'node.exe'
+
+Write-Host "Checking what is already imported..." -ForegroundColor DarkGray
+$existing = @{}
+foreach ($line in (& $n8nCmd list:workflow 2>$null)) {
+    if ($line -match '^([A-Za-z0-9]+)\|(.+)$') {
+        $existing[$Matches[2].Trim()] = $Matches[1]
+    }
+}
+if ($existing.Count -gt 0) {
+    foreach ($k in $existing.Keys) { Write-Host ("  found  {0}  {1}" -f $existing[$k], $k) -ForegroundColor DarkGray }
+} else {
+    Write-Host "  nothing imported yet" -ForegroundColor DarkGray
+}
+
+$temp = Join-Path $env:TEMP "pw-import-$(Get-Random)"
+New-Item -ItemType Directory -Force -Path $temp | Out-Null
+
+try {
+    # Error handler first: the main workflow needs its ID.
+    foreach ($file in @($errorWorkflow, $mainWorkflow)) {
+        # -Encoding UTF8 is load-bearing: without it PowerShell 5.1 reads the
+        # file as ANSI and any non-ASCII character in the name fails to match
+        # the list above, so the import silently creates a duplicate.
+        $name = (Get-Content $file -Raw -Encoding UTF8 | ConvertFrom-Json).name
+        $id = $existing[$name]
+        $staged = Join-Path $temp (Split-Path $file -Leaf)
+
+        $prepArgs = @("$ProjectRoot\scripts\prepare-import.mjs", "--file=$file", "--out=$staged")
+        if ($id) { $prepArgs += "--id=$id" }
+        & $nodeExe @prepArgs
+
+        & $n8nCmd import:workflow --input="$staged" | Out-Null
+    }
+} finally {
+    Remove-Item $temp -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host ""
 Write-Host "Imported workflows:" -ForegroundColor Green

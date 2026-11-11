@@ -1,5 +1,5 @@
 {
-  "name": "PlacidWay — Daily Facebook Post (anthropic)",
+  "name": "PlacidWay - Daily Facebook Post (anthropic)",
   "nodes": [
     {
       "parameters": {
@@ -111,6 +111,7 @@
     },
     {
       "parameters": {
+        "authentication": "serviceAccount",
         "documentId": {
           "__rl": true,
           "value": "={{ $json.run.sheetId }}",
@@ -133,7 +134,7 @@
       ],
       "alwaysOutputData": true,
       "credentials": {
-        "googleSheetsOAuth2Api": {
+        "googleApi": {
           "id": "PW_GOOGLE_SHEETS",
           "name": "PlacidWay Google Sheets"
         }
@@ -770,6 +771,7 @@
     },
     {
       "parameters": {
+        "authentication": "serviceAccount",
         "operation": "append",
         "documentId": {
           "__rl": true,
@@ -797,7 +799,7 @@
         -220
       ],
       "credentials": {
-        "googleSheetsOAuth2Api": {
+        "googleApi": {
           "id": "PW_GOOGLE_SHEETS",
           "name": "PlacidWay Google Sheets"
         }
@@ -1263,7 +1265,7 @@
   "pinData": {},
   "meta": {
     "builtBy": "scripts/build-workflow.mjs",
-    "builtAt": "2026-11-10T10:11:53.450Z",
+    "builtAt": "2026-11-11T03:49:20.967Z",
     "provider": "anthropic",
     "note": "Generated file. Edit lib/*.js and prompts/*.md, then re-run npm run build."
   }
