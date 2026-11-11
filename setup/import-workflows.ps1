@@ -32,7 +32,6 @@ if (-not (Test-Path $n8nCmd)) {
 }
 
 $env:N8N_BLOCK_ENV_ACCESS_IN_NODE = 'false'
-$env:N8N_RUNNERS_ENABLED = 'true'
 $env:N8N_DIAGNOSTICS_ENABLED = 'false'
 
 $errorWorkflow = Join-Path $ProjectRoot 'workflow\placidway-error-handler.json'

@@ -39,10 +39,9 @@ if (-not (Test-Path $n8nCmd)) {
 # and without this the workflow silently falls back to its built-in defaults.
 $env:N8N_BLOCK_ENV_ACCESS_IN_NODE = 'false'
 
-# Code nodes run in task runners in n8n 2.x. Without this you get a deprecation
-# warning on every execution.
-$env:N8N_RUNNERS_ENABLED = 'true'
-
+# Note: do NOT set N8N_RUNNERS_ENABLED. It was required briefly in n8n 1.x and
+# is deprecated in 2.x, which warns about it on every start. Task runners are
+# on by default now.
 # Over plain http on localhost the secure-cookie flag blocks the login form.
 $env:N8N_SECURE_COOKIE = 'false'
 
