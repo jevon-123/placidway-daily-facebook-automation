@@ -711,6 +711,19 @@ code(
 const d = $json;
 const resume = $execution.resumeUrl;
 
+// n8n 2.x signs the resume URL: it already ends in "?signature=...". Appending
+// the decision flag with another "?" makes the signature value read as
+// "<sig>?decision=approve", which fails verification and the webhook answers
+// 401. Use & when a query string is already present.
+const withDecision = (choice) =>
+  resume + (resume.indexOf('?') === -1 ? '?' : '&') + 'decision=' + choice;
+
+const approveUrl = withDecision('approve');
+const rejectUrl = withDecision('reject');
+
+// Telegram's HTML parser needs these escaped, and the URLs contain '&'.
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 const advisories = ((d.rules && d.rules.advisories) || [])
   .map((a) => '• ' + a.rule + ': ' + a.detail)
   .join('\\n') || '• none';
@@ -732,10 +745,24 @@ const message = [
   '<b>Advisories:</b>',
   advisories,
   '',
-  '<a href="' + resume + '?decision=approve">APPROVE</a>  |  <a href="' + resume + '?decision=reject">REJECT</a>',
+  '<a href="' + esc(approveUrl) + '">APPROVE</a>  |  <a href="' + esc(rejectUrl) + '">REJECT</a>',
+  '',
+  // Telegram refuses to hyperlink a localhost URL, so the buttons above render
+  // as plain text when n8n is running without a tunnel. The copyable form below
+  // always works. Start n8n with -Tunnel to get tappable links on a phone.
+  '<i>Not clickable? Copy this:</i>',
+  '<code>' + esc(approveUrl) + '</code>',
 ].join('\\n');
 
-return [{ json: { ...d, reviewMessage: message, resumeUrl: resume } }];`,
+return [{
+  json: {
+    ...d,
+    reviewMessage: message,
+    resumeUrl: resume,
+    approveUrl,
+    rejectUrl,
+  },
+}];`,
 );
 connect('Approval Mode?', 'Build Review Message', 0);
 

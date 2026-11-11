@@ -657,9 +657,14 @@ Stated plainly, because they are the interesting part of the conversation.
   next to each post is not implemented. The sheet has room for it and
   `fb_post_id` is already recorded, so it is a second scheduled workflow
   reading `/{post-id}/insights`, not a redesign.
-- **The approval webhook has no authentication.** Anyone holding the resume URL
-  can approve a post. For a demo on a private n8n that is acceptable; for
-  production the link needs a signed token.
+- **The approval link is a bearer secret.** n8n 2.x signs the resume URL
+  (`?signature=...`), so it cannot be guessed — but anyone who obtains the link
+  can approve the post, and it travels through Telegram. Acceptable for a demo;
+  production would want the decision recorded against an identified reviewer
+  rather than against whoever opened the URL.
+  *(Note for anyone extending this: because the resume URL already carries a
+  query string, the decision flag must be appended with `&`. Using `?` makes the
+  signature value swallow it and the webhook answers 401.)*
 - **Credential-bound node parameters are not statically verifiable.** The
   validator proves the graph is sound. It cannot prove your Google Sheets
   resource locators resolve — see the note in [Setup](#2-import-the-workflows).
